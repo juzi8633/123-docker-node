@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 剧集/电影主表
+model SeriesMain {
+  tmdbId      Int      @id @map("tmdb_id")
+  name        String
+  year        String?
+  type        String   // 'movie' or 'tv'
+  genres      String?
+  lastUpdated DateTime @default(now()) @map("last_updated")
+  
+  episodes    SeriesEpisode[]
+  @@map("series_main")
+}
+
+// 剧集分集/文件表
+model SeriesEpisode {
+  id          Int      @id @default(autoincrement())
+  tmdbId      Int      @map("tmdb_id")
+  season      Int?
+  episode     Int?
+  cleanName   String   @map("clean_name")
+  size        BigInt
+  etag        String
+  score       Int      @default(0)
+  type        String   // 'video' or 'subtitle'
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  series      SeriesMain @relation(fields: [tmdbId], references: [tmdbId], onDelete: Cascade)
+
+  @@index([tmdbId, season, episode])
+  @@map("series_episodes")
+}
+
+// 待处理任务表
+model PendingEpisode {
+  id          Int      @id @default(autoincrement())
+  etag        String
+  tmdbId      Int      @map("tmdb_id")
+  season      Int
+  episode     Int
+  cleanName   String   @map("clean_name")
+  size        BigInt
+  score       Int
+  type        String
+  sourceType  String   @map("source_type") // '123', '189', 'quark', 'openlist'
+  sourceRef   String?  @map("source_ref")
+  retryCount  Int      @default(0) @map("retry_count")
+  taskId      String?  @map("task_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  nextRetryAt BigInt   @default(0) @map("next_retry_at")
+
+  @@map("pending_episodes")
+}
+
+// KV 替代存储 (存Token/直链缓存)
+model KeyValueStore {
+  key       String   @id
+  value     String
+  expiresAt DateTime? @map("expires_at")
+
+  @@map("kv_store")
+}
+
+// 文件夹元数据 (WebDAV 目录时间)
+model FolderMeta {
+  key         String   @id
+  lastUpdated DateTime @map("last_updated")
+
+  @@map("folder_meta")
+}
+
+// 统计辅助表 (分类-年份)
+model StatsGenreYear {
+  id      Int    @id @default(autoincrement())
+  genreId Int    @map("genre_id")
+  type    String
+  year    String
+
+  @@unique([genreId, type, year])
+  @@map("stats_genre_years")
+}
+
+model SeriesGenre {
+  id      Int    @id @default(autoincrement())
+  tmdbId  Int    @map("tmdb_id")
+  genreId Int    @map("genre_id")
+  type    String
+
+  @@unique([tmdbId, genreId, type])
+  @@map("series_genres")
+}

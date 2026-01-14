@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    container_name: 123_node_app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=file:/app/data/dev.db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # 请在此处填入你的 123 盘配置
+      - CLIENT_ID=your_client_id
+      - CLIENT_SECRET=your_client_secret
+      - AUTH_PASSWORD=password123
+      - CALLBACK_SECRET=my-secret-key-123
+      - ROOT_FOLDER_ID=0
+    depends_on:
+      - redis
+    restart: always
+
+  redis:
+    image: redis:alpine
+    container_name: 123_redis
+    volumes:
+      - ./data/redis:/data
+    restart: always
