@@ -1,16 +1,29 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted, computed } from 'vue'
+// [修改] 根据之前的生成步骤，这些页面级组件建议放在 views 目录下
+// 如果你的文件实际在 components 目录下，请修改路径为 ./components/...
 import ConfigPanel from './components/ConfigPanel.vue'
 import LibraryView from './components/LibraryView.vue'
 import ImportView from './components/ImportView.vue'
 import VerificationView from './components/VerificationView.vue'
 
+// [核心新增] 引入全局配置初始化
+import { initConfig, globalConfig } from './utils/configStore.js'
+
 const showConfig = ref(false)
 const currentTab = ref('library')
+
+// 计算属性：检查配置是否已加载
+const configLoaded = computed(() => globalConfig.isLoaded)
 
 const switchTab = (tab) => {
   currentTab.value = tab
 }
+
+// [核心新增] App 挂载时立即拉取后端配置
+onMounted(async () => {
+    await initConfig()
+})
 </script>
 
 <template>
@@ -29,6 +42,13 @@ const switchTab = (tab) => {
         </div>
 
         <div class="flex items-center gap-3">
+          <Transition name="fade">
+            <div v-if="!configLoaded" class="hidden sm:flex items-center gap-2 px-3 py-1 bg-amber-50 text-amber-600 border border-amber-100 rounded-full text-xs font-bold animate-pulse">
+                <i class="fa-solid fa-circle-notch fa-spin"></i> 
+                <span>连接后端...</span>
+            </div>
+          </Transition>
+
           <button @click="showConfig = true" 
             class="w-9 h-9 rounded-full flex items-center justify-center text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95">
             <i class="fa-solid fa-gear text-lg"></i>
@@ -38,7 +58,7 @@ const switchTab = (tab) => {
     </header>
 
     <Transition name="fade">
-      <div v-if="showConfig" class="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6">
+      <div v-if="showConfig" class="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6">
         <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-sm transition-opacity" @click="showConfig = false"></div>
         <div class="relative w-full max-w-2xl bg-white rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
           <ConfigPanel @close="showConfig = false" />

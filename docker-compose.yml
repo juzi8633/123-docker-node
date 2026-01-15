@@ -11,11 +11,6 @@ services:
       - DATABASE_URL=file:/app/data/dev.db
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      # 请在此处填入你的 123 盘配置
-      - CLIENT_ID=your_client_id
-      - CLIENT_SECRET=your_client_secret
-      - AUTH_PASSWORD=password123
-      - CALLBACK_SECRET=my-secret-key-123
       - ROOT_FOLDER_ID=0
     depends_on:
       - redis

@@ -287,6 +287,7 @@ const autoMatchSingleItem = async (item, apiKey) => {
             bestMatch = await res.json()
             // 详情接口不返回 media_type，手动补全，供后续逻辑判断
             bestMatch.media_type = type 
+            // 详情接口返回的是 genres 对象数组 [{id,name},...], 需要转为 genre_ids 数组供后续使用
             bestMatch.genre_ids = bestMatch.genres.map(({id})=>id);
         }
     }
@@ -335,6 +336,22 @@ const applyTmdbMatch = (item, tmdbData) => {
   const title = tmdbData.name || tmdbData.title
   const year = (tmdbData.first_air_date || tmdbData.release_date || '').split('-')[0]
   
+  // =========================================================
+  // [修复核心] 提取语言和国家，用于后端 Strm 分类
+  // =========================================================
+  const originalLanguage = tmdbData.original_language || '';
+  
+  // 国家处理较为复杂，因为 TMDB 在不同接口返回结构不同
+  let originCountry = '';
+  
+  if (tmdbData.origin_country && Array.isArray(tmdbData.origin_country)) {
+      // TV 剧集通常有 origin_country 数组 (e.g. ['CN'])
+      originCountry = tmdbData.origin_country.join(',');
+  } else if (tmdbData.production_countries && Array.isArray(tmdbData.production_countries)) {
+      // 电影详情接口返回 production_countries 数组对象 (e.g. [{iso_3166_1: 'CN', name: 'China'}])
+      originCountry = tmdbData.production_countries.map(c => c.iso_3166_1).join(',');
+  }
+
   item.tmdbInfo = {
     id: tmdbData.id,
     name: title,
@@ -342,7 +359,10 @@ const applyTmdbMatch = (item, tmdbData) => {
     type: type,
     poster: tmdbData.poster_path,
     overview: tmdbData.overview,
-    genres: tmdbData.genre_ids
+    genres: tmdbData.genre_ids,
+    // [新增] 保存语言和国家信息
+    originalLanguage,
+    originCountry
   }
   
   const sourceType = (panType.value !== 'json' && shareUrl.value) ? panType.value : 'json';
@@ -416,6 +436,9 @@ const submitAll = async () => {
         seriesYear: item.tmdbInfo.year,
         type: item.tmdbInfo.type,
         genres: (item.tmdbInfo.genres || []).join(','),
+        // [新增] 提交语言和国家给后端
+        originalLanguage: item.tmdbInfo.originalLanguage,
+        originCountry: item.tmdbInfo.originCountry,
         sourceType: (panType.value !== 'json' && shareUrl.value) ? panType.value : 'json',
         jsonData: item.finalJson
       }

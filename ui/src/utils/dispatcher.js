@@ -22,22 +22,18 @@ export async function dispatchToBackground(selectedFiles) {
         source_ref: f.source_ref    // 'fileId|shareId'
     }));
 
-    // 2. 收集凭证 (从 localStorage 读取)
-    const authConfig = {
-        ty_token: localStorage.getItem('ty_accesstoken') || '',
-        quark_cookie: localStorage.getItem('quark_cookie') || '',
-        dir_id: localStorage.getItem('open123_dir_id') || ''
-    };
+    // [修改] 不再从前端收集凭证，后端 Worker 会自动从数据库读取配置
+    // const authConfig = { ... } <- 已移除
 
     try {
-        // 3. 发送给 DO
+        // 2. 发送给后端 API
         const res = await fetch('/api/do/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 action: 'ADD_TASKS',
-                tasks: tasks,
-                auth: authConfig
+                tasks: tasks
+                // [修改] 移除了 auth 字段
             })
         });
 

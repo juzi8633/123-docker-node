@@ -2,6 +2,7 @@
 node_modules/
 output_split/
 data/
+strm_data/
 .pnp
 .pnp.js
 

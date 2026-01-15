@@ -1,10 +1,9 @@
-// src/queue.js
-
 import { Queue, Worker } from 'bullmq';
 import { core123 } from './services/core123.js';
 import { prisma } from './db.js';
 import redis from './redis.js';
 import { createHash } from 'crypto';
+import { strmService } from './services/strm.js'; 
 
 const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
@@ -13,7 +12,7 @@ const REDIS_CONFIG = {
 
 export const downloadQueue = new Queue('download-queue', { connection: REDIS_CONFIG });
 
-// 189直链解析 (保持不变)
+// 辅助函数：189直链解析
 async function resolve189Link(sourceRef) {
     const token = await redis.get('auth:189:token');
     if (!token) throw new Error("缺少天翼云 AccessToken");
@@ -40,7 +39,10 @@ const worker = new Worker('download-queue', async (job) => {
   const taskName = task.cleanName || task.name; 
   const dbFileType = (task.tier === 'subtitle' || task.type === 'subtitle') ? 'subtitle' : 'video';
   
-  // 反查 Row ID
+  // 锁 Key
+  const LOCK_KEY = `lock:queue:${task.etag}`;
+  const LOCK_TTL = 60; 
+
   let rowId = task.id;
   if (!rowId || rowId <= 0) {
       const pendingRecord = await prisma.pendingEpisode.findFirst({ where: { etag: task.etag } });
@@ -50,73 +52,55 @@ const worker = new Worker('download-queue', async (job) => {
   console.log(`[Queue] 🔵 收到任务: ${taskName} (ID: ${rowId})`);
 
   try {
-    // ==================================================
-    // 🔥 [核心优化] 数据库前置检查 (Pre-Check)
-    // ==================================================
+    // 1. 获取分布式锁
+    const acquired = await redis.set(LOCK_KEY, 'LOCKED', 'NX', 'EX', LOCK_TTL);
+    if (!acquired) {
+        // console.warn(`[Queue] 🔒 任务锁定中: ${taskName}`);
+        throw new Error('Task Locked (Concurrency Protection)');
+    }
+
+    // 2. 数据库前置检查
     if (task.tmdbId && task.season && task.episode) {
-        // 查库：看这个位置有没有文件
         const existing = await prisma.seriesEpisode.findFirst({
             where: {
                 tmdbId: task.tmdbId,
                 season: task.season,
                 episode: task.episode,
-                type: dbFileType // 区分视频和字幕
+                type: dbFileType
             }
         });
 
         if (existing) {
-            // 情况 1: 完全相同的文件 (Etag 一样) -> 跳过
             if (existing.etag === task.etag) {
-                console.log(`[Queue] ⏭️ 跳过重复文件 (Hash相同): ${taskName}`);
-                // 清理 Pending 记录
+                console.log(`[Queue] ⏭️ 跳过重复文件: ${taskName}`);
                 if (rowId > 0) await prisma.pendingEpisode.delete({ where: { id: rowId } });
+                await redis.del(LOCK_KEY);
                 return { status: 'skipped_duplicate' };
             }
-
-            // 情况 2: 库里画质更好或相等 -> 跳过 (不做降级)
             const oldScore = existing.score || 0;
             const newScore = task.score || 0;
-            
             if (oldScore >= newScore) {
-                console.log(`[Queue] ⏭️ 跳过低分/同分文件 (库内:${oldScore} vs 新:${newScore}): ${taskName}`);
-                // 清理 Pending 记录
+                console.log(`[Queue] ⏭️ 跳过低分文件: ${taskName}`);
                 if (rowId > 0) await prisma.pendingEpisode.delete({ where: { id: rowId } });
+                await redis.del(LOCK_KEY);
                 return { status: 'skipped_low_score' };
             }
-
-            // 情况 3: 新文件分更高 -> 继续执行 (将触发覆盖逻辑)
-            console.log(`[Queue] 🆙 发现更高画质 (库内:${oldScore} -> 新:${newScore})，准备升级: ${taskName}`);
+            console.log(`[Queue] 🆙 准备洗版升级: ${taskName}`);
         }
     }
+
     // ==================================================
-
-    const token = await core123.getAccessToken();
-    const parentID = await core123.getUploadParentID();
-
-    // A. 尝试秒传
-    const createRes = await fetch("https://open-api.123pan.com/upload/v2/file/create", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${token}`, "Platform": "open_platform", "Content-Type": "application/json" },
-        body: JSON.stringify({
-            parentFileID: parentID,
-            filename: taskName,
-            etag: task.etag,
-            size: Number(task.size),
-            duplicate: 2 
-        })
-    });
-    
-    const createJson = await createRes.json();
-    const canReuse = (createJson.code === 0 && createJson.data?.reuse === true);
+    // [修改点] 使用工兵账号进行秒传探测 (Probe)
+    // ==================================================
+    // 不再调用 getAccessToken，而是直接调用 probeFileByHash
+    const canReuse = await core123.probeFileByHash(taskName, task.etag, Number(task.size));
 
     if (canReuse) {
-        console.log(`[Queue] ✅ 秒传成功: ${taskName}`);
+        console.log(`[Queue] ✅ 秒传成功 (工兵探测确认): ${taskName}`);
         
-        // 事务：先删旧(为了覆盖) -> 再插入 -> 删Pending
         const now = new Date();
         const ops = [];
         
-        // 如果是视频，先清理旧占位 (虽然 Upsert 可以，但为了保险先 Delete)
         if (dbFileType !== 'subtitle') {
             ops.push(prisma.seriesEpisode.deleteMany({
                 where: { tmdbId: task.tmdbId, season: task.season, episode: task.episode, type: { not: 'subtitle' } }
@@ -135,37 +119,43 @@ const worker = new Worker('download-queue', async (job) => {
         if (rowId > 0) ops.push(prisma.pendingEpisode.delete({ where: { id: rowId } }));
 
         await prisma.$transaction(ops);
+
+        // 触发 strm 生成
+        try {
+            const newEp = await prisma.seriesEpisode.findFirst({
+                where: { tmdbId: task.tmdbId, season: task.season, episode: task.episode, type: dbFileType },
+                orderBy: { id: 'desc' }
+            });
+            if (newEp) {
+                // console.log(`[Queue] 🔄 Strm update ID: ${newEp.id}`);
+                await strmService.syncEpisode(newEp.id);
+            }
+        } catch (strmErr) { console.error(strmErr); }
+        
+        await redis.del(LOCK_KEY);
         return { status: 'rapid_success' };
     }
 
-    // B. 秒传失败降级逻辑
-    console.log(`[Queue] ⚠️ 秒传失败: ${taskName}`);
+    // B. 秒传失败 -> 离线下载 (Fallback)
+    console.log(`[Queue] ⚠️ 秒传失败，准备离线下载: ${taskName}`);
 
-    if (task.sourceType === 'quark') {
-        // [关键] 夸克不支持离线，直接抛出UnrecoverableError避免重试？
-        // BullMQ 默认会重试，如果你想让它直接失败，需要特殊处理
-        // 但这里我们抛出错误，让它在 Pending 表里显示重试次数增加，也没问题
-        throw new Error("夸克秒传失败 (云端无此文件)，不支持离线下载");
-    }
+    if (task.sourceType === 'quark') throw new Error("夸克不支持离线下载");
 
-    console.log(`[Queue] 🔄 尝试转离线下载 (${task.sourceType})...`);
-    
     let downloadUrl = task.url; 
-    if (task.sourceType === '189') {
-        downloadUrl = await resolve189Link(task.sourceRef);
-    }
-
-    if (!downloadUrl || !downloadUrl.startsWith('http')) {
-        throw new Error(`无法获取下载直链，无法离线下载`);
-    }
+    if (task.sourceType === '189') downloadUrl = await resolve189Link(task.sourceRef);
+    if (!downloadUrl || !downloadUrl.startsWith('http')) throw new Error(`无法获取下载直链`);
 
     const callbackKey = process.env.CALLBACK_SECRET;
     const host = process.env.HOST_URL || 'http://localhost:3000'; 
     const callbackUrl = `${host}/api/callback/123?id=${rowId}&key=${callbackKey}`;
 
+    // [修改点] 离线下载必须使用 VIP 账号 Token
+    const vipToken = await core123.getVipToken();
+    const parentID = await core123.getUploadParentID(); // 获取 VIP 缓存目录
+
     const offlineRes = await fetch("https://open-api.123pan.com/api/v1/offline/download", {
         method: "POST",
-        headers: { "Authorization": `Bearer ${token}`, "Platform": "open_platform", "Content-Type": "application/json" },
+        headers: { "Authorization": `Bearer ${vipToken}`, "Platform": "open_platform", "Content-Type": "application/json" },
         body: JSON.stringify({
             url: downloadUrl, fileName: taskName, dirID: parentID, callBackUrl: callbackUrl
         })
@@ -182,24 +172,31 @@ const worker = new Worker('download-queue', async (job) => {
     }
 
     console.log(`[Queue] 🚀 离线任务已提交 TaskID: ${offlineJson.data.taskID}`);
+    
+    await redis.del(LOCK_KEY);
     return { status: 'downloading', taskId: offlineJson.data.taskID };
 
   } catch (e) {
-    console.error(`[Queue] ❌ 失败: ${e.message}`);
-    if (rowId > 0) {
-        await prisma.pendingEpisode.update({ where: { id: rowId }, data: { retryCount: { increment: 1 } } });
+    if (e.message !== 'Task Locked (Concurrency Protection)') {
+        const LOCK_KEY = `lock:queue:${task.etag}`;
+        await redis.del(LOCK_KEY).catch(() => {});
+        console.error(`[Queue] ❌ 失败: ${e.message}`);
+        
+        if (rowId > 0) {
+            await prisma.pendingEpisode.update({ where: { id: rowId }, data: { retryCount: { increment: 1 } } });
+        }
     }
-    throw e; 
+    throw e;
   }
 }, { 
     connection: REDIS_CONFIG,
-    limiter: { max: 1, duration: 3000 } // 保持限流
+    limiter: { max: 1, duration: 3000 } // 提高并发，因为 probeFileByHash 很快
 });
 
 export const addToQueue = async (taskData) => {
   await downloadQueue.add('process', taskData, {
     removeOnComplete: true,
-    attempts: taskData.sourceType === 'quark' ? 1 : 3, // 夸克只试1次，其他试3次
-    backoff: { type: 'exponential', delay: 5000 }
+    attempts: taskData.sourceType === 'quark' ? 1 : 5,
+    backoff: { type: 'exponential', delay: 2000 }
   });
 };

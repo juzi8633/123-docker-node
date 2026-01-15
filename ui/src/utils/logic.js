@@ -15,16 +15,24 @@ export const TMDB_GENRES = {
 
 export const cnNums = {'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10,'零':0,'〇':0,'两':2};
 
-// [新增] 强大的 TMDB ID 提取正则
 // 兼容: {tmdb-123}, [tmdbid=123], (tmdb 123), 【tmdb:123】 等格式
 export const TMDB_ID_REGEX = /[\[\(\{【]tmdb(?:id)?[\s\-_=+\/:\.]*(\d+)\s*[\]\)\}】]/i;
 
 export function formatSize(bytes) {
-    if (bytes === 0) return '0 B';
+    // [严谨] 强制转为数字，防止传入字符串导致计算错误
+    const num = Number(bytes);
+    if (num === 0 || isNaN(num)) return '0 B';
+
     const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+
+    // 计算索引
+    const i = Math.floor(Math.log(num) / Math.log(k));
+
+    const safeIndex = Math.min(i, sizes.length - 1);
+
+    return parseFloat((num / Math.pow(k, safeIndex)).toFixed(2)) + ' ' + sizes[safeIndex];
 }
 
 function cnToInt(str) {
@@ -47,18 +55,13 @@ function cnToInt(str) {
     return val + tmp;
 }
 
-// 增强季数解析
 export function parseSeason(text) {
     if (!text) return 0;
-    
-    // 1. 优先匹配 SxxExx (含紧凑型 S01E01)
     const standardMatch = text.match(/[ \._\-]S(\d+)E\d+/i) || text.match(/^S(\d+)E\d+/i) || text.match(/S(\d+)E\d+/i);
     if (standardMatch) return parseInt(standardMatch[1]);
 
-    // 2. 匹配 Season 4, S4., 第四季
     const m = text.match(/(?:^|[\.\s_])(?:Season|S)\s*(\d+)(?:[\.\s_]|E|$)/i) || 
               text.match(/第([一二三四五六七八九十0-9]+)季/);
-    
     if (m) {
         return /^\d+$/.test(m[1]) ? parseInt(m[1]) : cnToInt(m[1]);
     }
@@ -91,19 +94,13 @@ export function parseEpisode(text) {
     return null;
 }
 
-// ==========================================
-// [核心模块] 文件名智能提取 (完整修复版)
-// ==========================================
-
 const DATE_REGEX = /(?:20\d{2}[-_\.]\d{1,2}[-_\.]\d{1,2})|(?:20\d{6})/;
 
-// 严格技术参数 (无边界清除)
 const JUNK_TERMS_STRICT = [
     /\b(4k|2160p|1080p|720p|remux|bluray|uhd|hdr|dv|hevc|x26[45]|avc|dts|truehd|atmos|\bma\b|aac|flac|ddp|web-?dl|hdtv|repack|proper|v2|edr)\b/ig,
     /\b(Hi10p|10bit|60fps|vivid|maxplus|hiveweb|momoweb|oldk|老k|PTerWEB|OPS)\b/ig
 ];
 
-// 宽松垃圾词库 (带边界检查)
 const JUNK_TERMS_LOOSE = [
     /(^|\s)(中英[双两]字|国英[双两]语|国粤[双两]语|中字|字幕|特效)($|\s)/i,
     /(^|\s)(合集|全集|打包|系列|部合集|版本)($|\s)/i,
@@ -117,15 +114,12 @@ const JUNK_TERMS_LOOSE = [
 ];
 
 const extractors = {
-    // 提取年份
     year: (str) => {
         const m = str.match(/(?:^|[\.\s_\[\(\（-])(?<year>(?:19|20)\d{2})(?:$|[\.\s_\]\)\）-])/);
         return m?.groups?.year || "";
     },
     
-    // 智能截取标题
     smartCleanTitle: (fileName) => {
-        // [修复] 1. 基础字符清洗 (HTML实体 & 全角符号) - 恢复原代码逻辑
         let raw = fileName
             .replace(/&#39;/g, "'")
             .replace(/&amp;/g, "&")
@@ -136,14 +130,13 @@ const extractors = {
             .replace(/／/g, " ")
             .replace(/\//g, " ");
 
-        // 2. 寻找截断点
         const breakPoints = [
-            /(?:19|20)\d{2}/, // 年份
-            /S\d+E\d+/i, /S\d+/i, /Season\s*\d+/i, // 季集
+            /(?:19|20)\d{2}/, 
+            /S\d+E\d+/i, /S\d+/i, /Season\s*\d+/i, 
             /第\d+[季集期]/, /先导片/,
-            /1080[pP]|720[pP]|2160[pP]|4[kK]|8[kK]/, // 分辨率
-            /BluRay|WEB-?DL|WEBRip|HDTV|Remux|ISO|DVD/i, // 来源
-            /H\.?26[45]|HEVC|AVC|AV1|AAC|DTS|Atmos|TrueHD/i, // 编码
+            /1080[pP]|720[pP]|2160[pP]|4[kK]|8[kK]/, 
+            /BluRay|WEB-?DL|WEBRip|HDTV|Remux|ISO|DVD/i, 
+            /H\.?26[45]|HEVC|AVC|AV1|AAC|DTS|Atmos|TrueHD/i, 
         ];
 
         let cutoffIndex = raw.length;
@@ -155,20 +148,12 @@ const extractors = {
         }
 
         raw = raw.substring(0, cutoffIndex);
-
-        // 3. 符号标准化
         raw = raw.replace(/[\.\_\-\[\]【】\(\)（）]/g, ' ').trim();
-        
-        // 4. 应用严格垃圾词清洗
         JUNK_TERMS_STRICT.forEach(regex => { raw = raw.replace(regex, ' '); });
-
-        // 5. 应用边界检查的宽松垃圾词清洗
         JUNK_TERMS_LOOSE.forEach(regex => { 
             let oldRaw;
             do { oldRaw = raw; raw = raw.replace(regex, ' '); } while (raw !== oldRaw);
         });
-        
-        // 6. 去除末尾的 "版"
         raw = raw.replace(/版$/i, '');
 
         return raw.replace(/\s+/g, ' ').trim();
@@ -180,10 +165,8 @@ export function extractFileInfo(fullPath) {
     const parts = normalizedPath.split('/').filter(Boolean);
     let fileName = parts[parts.length - 1];
     
-    // 移除扩展名
     fileName = fileName.replace(/\.(mp4|mkv|avi|mov|wmv|iso|ts|flv|srt|ass|ssa|sub|vtt|rmvb|webm|m2ts)$/i, "");
 
-    // [新增] 0. 优先尝试从父目录提取 TMDB ID
     let tmdbId = null;
     if (parts.length >= 2) {
         const parentDir = parts[parts.length - 2];
@@ -193,7 +176,6 @@ export function extractFileInfo(fullPath) {
         }
     }
 
-    // 1. 提取年份
     let year = extractors.year(fileName);
     if (!year && parts.length >= 2) {
         for (let i = parts.length - 2; i >= Math.max(0, parts.length - 4); i--) {
@@ -202,10 +184,7 @@ export function extractFileInfo(fullPath) {
         }
     }
 
-    // 2. 使用“截断法”获取清洗后的初步标题
     let rawTitle = extractors.smartCleanTitle(fileName);
-    
-    // 3. 中英分离逻辑 (已恢复)
     let chineseName = "";
     let englishName = "";
     
@@ -232,13 +211,10 @@ export function extractFileInfo(fullPath) {
     } else {
         chineseName = rawTitle;
     }
-    
     chineseName = chineseName.replace(/[\.\s]+$/, '');
     
-    // 最终搜索词
     let searchQuery = englishName && englishName.length >= 2 ? englishName : chineseName;
 
-    // 4. 目录回退机制 (FIXED: 增强对无效标题的判定)
     const isInvalidTitle = (t) => {
         return !t || 
                t.length < 2 || 
@@ -252,12 +228,9 @@ export function extractFileInfo(fullPath) {
         if (seasonFolderRegex.test(parentDir) && parts.length >= 3) {
             parentDir = parts[parts.length - 3];
         }
-        
-        // [修复] 使用增强的正则移除 ID，避免影响标题识别
         parentDir = parentDir.replace(TMDB_ID_REGEX, ''); 
 
         let parentTitle = extractors.smartCleanTitle(parentDir);
-        
         if (!isInvalidTitle(parentTitle)) {
             console.log(`[识别修正] 文件名无效(${searchQuery})，回退使用目录名: [${parentTitle}]`);
             searchQuery = parentTitle;
@@ -266,7 +239,6 @@ export function extractFileInfo(fullPath) {
         }
     }
 
-    // 5. 判断是否为剧集
     const epNum = parseEpisode(fileName);
     const isVariety = /第\d+期/.test(fileName) || /先导片/.test(fileName);
     const isTV = isVariety || epNum !== null || /Season\s*\d+/i.test(normalizedPath);
@@ -275,7 +247,7 @@ export function extractFileInfo(fullPath) {
         originalName: fileName,
         path: fullPath,
         year: year,
-        tmdbId: tmdbId, // [新增] 返回提取到的 ID
+        tmdbId: tmdbId,
         chineseName: chineseName,
         englishName: englishName,
         searchQuery: searchQuery, 
@@ -319,8 +291,6 @@ export function autoGroupFiles(rawFilesData) {
     const groups = {}; 
     validFiles.forEach(file => {
         const info = extractFileInfo(file._fullPath);
-        
-        // 分组 Key 生成逻辑
         const safeName = info.searchQuery.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
         const groupKey = info.isTV ? `tv_${safeName}` : `movie_${safeName}_${info.year || 'ny'}`;
 
@@ -329,18 +299,16 @@ export function autoGroupFiles(rawFilesData) {
                 key: groupKey,
                 searchQuery: info.searchQuery, 
                 year: info.year,
-                tmdbId: info.tmdbId, // [新增] 保存 ID 到分组
+                tmdbId: info.tmdbId, 
                 isTV: info.isTV,
                 files: []
             };
         } else if (info.tmdbId && !groups[groupKey].tmdbId) {
-            // 如果同组的其他文件有 ID，补充进去
             groups[groupKey].tmdbId = info.tmdbId;
         }
         groups[groupKey].files.push(file);
     });
 
-    // 处理预览标签
     Object.values(groups).forEach(group => {
         if (!group.isTV) {
             group.files.forEach(f => {
@@ -410,11 +378,25 @@ export function analyzeName(name) {
     return { resolution, tagsArray: tags };
 }
 
+// === [修改核心] 评分系统 ===
 export function calculateScore(analysis, sizeBytes, isMovie) {
+    const sizeInGB = Number(sizeBytes) / (1024 * 1024 * 1024);
+
+    // ============================================
+    // 🔥 [新规则] 一票否决区
+    // ============================================
+    
+    // 1. 体积过大 (超过 30GB) -> 0分
+    if (sizeInGB > 30) return 0;
+
+    // 2. 杜比视界 (DV) -> 0分
+    if (analysis && analysis.tagsArray.includes('DV')) return 0;
+
+    // ============================================
+
     let score = 500;
     if (!analysis) return score;
     const { resolution, tagsArray } = analysis;
-    const sizeInGB = sizeBytes / (1024 * 1024 * 1024);
     const minGolden = isMovie ? 5 : 1.5;
     const maxGolden = isMovie ? 30 : 15;
     const isGoldenZone = sizeInGB >= minGolden && sizeInGB <= maxGolden;
@@ -437,11 +419,12 @@ export function calculateScore(analysis, sizeBytes, isMovie) {
     if (tagsArray.includes('H265') || tagsArray.includes('AV1')) score += isGoldenZone ? 600 : 200;
     else if (tagsArray.includes('H264')) score += (effResolution === '2160p' ? -500 : 50);
 
+    // HDR 加分 (DV 已被否决，这里只剩纯 HDR)
     if (tagsArray.includes('HDR')) score += 400;
-    if (tagsArray.includes('DV')) score += tagsArray.includes('HDR') ? 200 : -200;
 
     if (tagsArray.includes('Atmos') || tagsArray.includes('DTS-X')) score += 400;
     else if (tagsArray.includes('TrueHD') || tagsArray.includes('DTS-HD')) score += 300;
+    else if (tagsArray.includes('DDP')) score += 100;
 
     let sizeWeight = isGoldenZone ? 200 : (sizeInGB < minGolden ? 50 : 20);
     score += Math.min(Math.round(sizeInGB * sizeWeight), 2000);
@@ -481,11 +464,14 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
       const analysis = isSubtitle ? null : analyzeName(fileName);
       const langTag = isSubtitle ? detectSubtitleLanguage(fileName) : "";
       
+      // 使用新的评分逻辑
       let finalScore = (!isSubtitle && analysis) ? calculateScore(analysis, f.size, isMovie) : 0;
       
       let videoBaseNameTemplate = ""; 
       if (!isSubtitle) {
           const tags = analysis ? analysis.tagsArray : [];
+          // 移除被否决的标签 (如 DV)，避免文件名出现已被淘汰的特性
+          // 或者保留它们以便 debug，这里选择保留，因为 strm.js 才是最终决定文件名的
           const nameParts = [rawTitle, epNamePart, year, ...tags];
           videoBaseNameTemplate = nameParts.filter(Boolean).join('.');
       }
@@ -522,6 +508,9 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
       
       if(videos.length > 0) {
           const best = videos[0];
+          // 如果最佳版本的得分是 0，说明所有版本都被否决了
+          // 这里我们仍然生成 JSON，但后端会自动处理（跳过或入库等待被覆盖）
+          
           const finalName = best.videoBaseNameTemplate + best.ext;
           
           finalFiles.push({ ...best.data, path: best.seasonFolder + finalName, clean_name: finalName });
@@ -534,7 +523,7 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
   }
 
   return { 
-      scriptVersion: "3.5.3", exportVersion: "1.0", usesBase62EtagsInExport: false, 
+      scriptVersion: "3.5.4", exportVersion: "1.0", usesBase62EtagsInExport: false, 
       commonPath: commonPath, files: finalFiles, 
       totalFilesCount: finalFiles.length, totalSize: finalFiles.reduce((a,c)=>a+c.size,0) 
   };

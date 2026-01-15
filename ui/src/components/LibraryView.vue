@@ -326,7 +326,7 @@ onMounted(() => {
               <div class="flex justify-between items-center mb-4">
                 <span class="text-xs font-bold text-slate-500 flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-slate-200 shadow-sm">
                   <i class="fa-solid fa-hard-drive text-indigo-500"></i> 
-                  总大小: {{ formatSize(detailCache[item.tmdbId].episodes.reduce((a,b)=>a+b.size, 0)) }}  共{{ detailCache[item.tmdbId] && detailCache[item.tmdbId].episodes && detailCache[item.tmdbId].episodes.length }}条
+                  总大小: {{ formatSize(detailCache[item.tmdbId].episodes.reduce((a,b)=>a+Number(b.size), 0)) }}  共{{ detailCache[item.tmdbId] && detailCache[item.tmdbId].episodes && detailCache[item.tmdbId].episodes.length }}条
                 </span>
                 
                 <div class="flex gap-2">
