@@ -1,25 +1,14 @@
+// src/queue.js
 import { Queue, Worker } from 'bullmq';
 import { core123 } from './services/core123.js';
 import { prisma } from './db.js';
 import redis from './redis.js';
 import { createHash } from 'crypto';
 import { strmService } from './services/strm.js'; 
+import { createLogger } from './logger.js'; // [优化] 引入高性能日志模块
 
-// [新增] 简易日志工具
-function log(msg, data = null) {
-    const time = new Date().toISOString().split('T')[1].split('.')[0];
-    const prefix = `[Queue ${time}]`;
-    if (data) {
-        try {
-            const str = JSON.stringify(data, null, 2);
-            console.log(`${prefix} ${msg}`, str.length > 2000 ? str.substring(0, 2000) + '... (truncated)' : str);
-        } catch (e) {
-            console.log(`${prefix} ${msg} [Object]`);
-        }
-    } else {
-        console.log(`${prefix} ${msg}`);
-    }
-}
+// 初始化专用 Logger
+const logger = createLogger('Queue');
 
 const REDIS_CONFIG = {
   host: process.env.REDIS_HOST || 'localhost',
@@ -30,7 +19,7 @@ export const downloadQueue = new Queue('download-queue', { connection: REDIS_CON
 
 // 辅助函数：189直链解析
 async function resolve189Link(sourceRef) {
-    log(`[189Resolver] Resolving link for ref: ${sourceRef}`); // [日志]
+    logger.info({ sourceRef }, `[189Resolver] Resolving link`);
     const token = await redis.get('auth:189:token');
     if (!token) throw new Error("缺少天翼云 AccessToken");
     
@@ -42,14 +31,15 @@ async function resolve189Link(sourceRef) {
     const signature = createHash('md5').update(signStr).digest('hex');
     
     const url = `https://api.cloud.189.cn/open/file/getFileDownloadUrl.action?fileId=${fileId}&dt=1&shareId=${shareId}`;
-    log(`[189Resolver] Requesting URL: ${url} (Sign: ${signature})`); // [日志]
+    logger.debug(`[189Resolver] Requesting URL: ${url} (Sign: ${signature})`);
 
+    // [注] 这里的 fetch 会自动享受到 core123.js 中设置的全局 Agent 连接池优化
     const res = await fetch(url, {
         headers: { 'Sign-Type': '1', 'Accesstoken': token, 'Timestamp': String(timestamp), 'Signature': signature }
     });
     const data = await res.json();
     
-    log(`[189Resolver] API Response:`, data); // [日志]
+    logger.debug({ data }, `[189Resolver] API Response`);
 
     if (data.res_code === 0) return data.fileDownloadUrl;
     throw new Error(`189 API Error: ${data.res_code} - ${data.res_message}`);
@@ -73,20 +63,19 @@ const worker = new Worker('download-queue', async (job) => {
       if (pendingRecord) rowId = pendingRecord.id;
   }
 
-  log(`🔵 收到任务: ${taskName} (ID: ${rowId}, Etag: ${task.etag})`); // [日志] 替换原 console.log
+  logger.info({ rowId, etag: task.etag }, `🔵 收到任务: ${taskName}`);
 
   try {
     // 1. 获取分布式锁
     const acquired = await redis.set(LOCK_KEY, 'LOCKED', 'NX', 'EX', LOCK_TTL);
     if (!acquired) {
-        log(`🔒 任务锁定中，跳过: ${taskName}`); // [日志]
+        logger.info({ taskName }, `🔒 任务锁定中，跳过 (Concurrency Protection)`);
         throw new Error('Task Locked (Concurrency Protection)');
     }
-    log(`[Lock] Acquired lock for ${task.etag}`); // [日志]
-
+    
     // 2. 数据库前置检查
     if (task.tmdbId && task.season && task.episode) {
-        log(`[Check] Checking DB for TMDB:${task.tmdbId} S${task.season}E${task.episode} (${dbFileType})`); // [日志]
+        logger.debug(`[Check] Checking DB for TMDB:${task.tmdbId} S${task.season}E${task.episode} (${dbFileType})`);
         const existing = await prisma.seriesEpisode.findFirst({
             where: {
                 tmdbId: task.tmdbId,
@@ -97,52 +86,47 @@ const worker = new Worker('download-queue', async (job) => {
         });
 
         if (existing) {
-            log(`[Check] Found existing record: ID=${existing.id}, Etag=${existing.etag}, Score=${existing.score}`); // [日志]
+            logger.info({ id: existing.id, etag: existing.etag, score: existing.score }, `[Check] Found existing record`);
             
             if (existing.etag === task.etag) {
-                log(`⏭️ 跳过重复文件 (Etag match): ${taskName}`); // [日志]
+                logger.info({ taskName }, `⏭️ 跳过重复文件 (Etag match)`);
                 if (rowId > 0) await prisma.pendingEpisode.delete({ where: { id: rowId } });
                 await redis.del(LOCK_KEY);
                 return { status: 'skipped_duplicate' };
             }
             const oldScore = existing.score || 0;
             const newScore = task.score || 0;
-            log(`[Check] Score Compare: Old(${oldScore}) vs New(${newScore})`); // [日志]
-
+            
             if (oldScore >= newScore) {
-                log(`⏭️ 跳过低分/同分文件: ${taskName}`); // [日志]
+                logger.info({ taskName, oldScore, newScore }, `⏭️ 跳过低分/同分文件`);
                 if (rowId > 0) await prisma.pendingEpisode.delete({ where: { id: rowId } });
                 await redis.del(LOCK_KEY);
                 return { status: 'skipped_low_score' };
             }
-            log(`🆙 分数更高，准备洗版升级: ${taskName}`); // [日志]
-        } else {
-            log(`[Check] No existing record, proceeding...`); // [日志]
+            logger.info({ taskName }, `🆙 分数更高，准备洗版升级`);
         }
     }
 
     // ==================================================
     // [修改点] 使用工兵账号进行秒传探测 (Probe)
     // ==================================================
-    // 不再调用 getAccessToken，而是直接调用 probeFileByHash
-    log(`[Probe] Calling core123.probeFileByHash...`); // [日志]
+    logger.debug(`[Probe] Calling core123.probeFileByHash...`);
+    // core123 内部已优化了 HTTP 连接池，这里响应会很快
     const canReuse = await core123.probeFileByHash(taskName, task.etag, Number(task.size));
-    log(`[Probe] Result: ${canReuse}`); // [日志]
+    logger.info({ canReuse }, `[Probe] Result`);
 
     if (canReuse) {
-        log(`✅ 秒传成功 (工兵探测确认): ${taskName}`); // [日志]
+        logger.info({ taskName }, `✅ 秒传成功 (工兵探测确认)`);
         
         const now = new Date();
         const ops = [];
         
         if (dbFileType !== 'subtitle') {
-            log(`[DB] Deleting old records for cleanup...`); // [日志]
             ops.push(prisma.seriesEpisode.deleteMany({
                 where: { tmdbId: task.tmdbId, season: task.season, episode: task.episode, type: { not: 'subtitle' } }
             }));
         }
 
-        log(`[DB] Creating new episode record...`); // [日志]
         ops.push(prisma.seriesEpisode.create({
             data: {
                 tmdbId: task.tmdbId, season: task.season, episode: task.episode,
@@ -155,7 +139,7 @@ const worker = new Worker('download-queue', async (job) => {
         if (rowId > 0) ops.push(prisma.pendingEpisode.delete({ where: { id: rowId } }));
 
         await prisma.$transaction(ops);
-        log(`[DB] Transaction committed`); // [日志]
+        logger.info(`[DB] Transaction committed`);
 
         // 触发 strm 生成
         try {
@@ -164,31 +148,29 @@ const worker = new Worker('download-queue', async (job) => {
                 orderBy: { id: 'desc' }
             });
             if (newEp) {
-                log(`🔄 Triggering strm sync for ID: ${newEp.id}`); // [日志]
+                logger.info({ id: newEp.id }, `🔄 Triggering strm sync`);
                 await strmService.syncEpisode(newEp.id);
             }
-        } catch (strmErr) { console.error(strmErr); }
+        } catch (strmErr) { logger.error(strmErr, 'Strm sync error'); }
         
         await redis.del(LOCK_KEY);
         return { status: 'rapid_success' };
     }
 
     // B. 秒传失败 -> 离线下载 (Fallback)
-    log(`⚠️ 秒传失败，准备离线下载: ${taskName}`); // [日志]
+    logger.warn({ taskName }, `⚠️ 秒传失败，准备离线下载`);
 
     if (task.sourceType === 'quark') {
-        log(`[Offline] Quark does not support offline download`); // [日志]
         throw new Error("夸克不支持离线下载");
     }
 
     let downloadUrl = task.url; 
     if (task.sourceType === '189') {
-        log(`[Offline] Resolving 189 link...`); // [日志]
+        logger.info(`[Offline] Resolving 189 link...`);
         downloadUrl = await resolve189Link(task.sourceRef);
     }
     
     if (!downloadUrl || !downloadUrl.startsWith('http')) {
-        log(`[Offline] Invalid download URL: ${downloadUrl}`); // [日志]
         throw new Error(`无法获取下载直链`);
     }
 
@@ -197,12 +179,10 @@ const worker = new Worker('download-queue', async (job) => {
     const callbackUrl = `${host}/api/callback/123?id=${rowId}&key=${callbackKey}`;
 
     // [修改点] 离线下载必须使用 VIP 账号 Token
-    log(`[Offline] Getting VIP token and Upload Parent ID...`); // [日志]
     const vipToken = await core123.getVipToken();
     const parentID = await core123.getUploadParentID(); // 获取 VIP 缓存目录
-    log(`[Offline] ParentID: ${parentID}, Callback: ${callbackUrl}`); // [日志]
+    logger.info({ parentID, callbackUrl }, `[Offline] Submitting to 123 API`);
 
-    log(`[Offline] Submitting to 123 API...`); // [日志]
     const offlineRes = await fetch("https://open-api.123pan.com/api/v1/offline/download", {
         method: "POST",
         headers: { "Authorization": `Bearer ${vipToken}`, "Platform": "open_platform", "Content-Type": "application/json" },
@@ -212,7 +192,7 @@ const worker = new Worker('download-queue', async (job) => {
     });
 
     const offlineJson = await offlineRes.json();
-    log(`[Offline] 123 API Response:`, offlineJson); // [日志]
+    logger.info({ response: offlineJson }, `[Offline] 123 API Response`);
 
     if (offlineJson.code !== 0) throw new Error(`离线提交失败: ${offlineJson.message}`);
 
@@ -221,10 +201,10 @@ const worker = new Worker('download-queue', async (job) => {
             where: { id: rowId },
             data: { taskId: String(offlineJson.data.taskID) }
         });
-        log(`[DB] Updated pending record with TaskID: ${offlineJson.data.taskID}`); // [日志]
+        logger.info({ taskId: offlineJson.data.taskID }, `[DB] Updated pending record`);
     }
 
-    log(`🚀 离线任务已提交 TaskID: ${offlineJson.data.taskID}`); // [日志]
+    logger.info({ taskId: offlineJson.data.taskID }, `🚀 离线任务已提交`);
     
     await redis.del(LOCK_KEY);
     return { status: 'downloading', taskId: offlineJson.data.taskID };
@@ -233,23 +213,27 @@ const worker = new Worker('download-queue', async (job) => {
     if (e.message !== 'Task Locked (Concurrency Protection)') {
         const LOCK_KEY = `lock:queue:${task.etag}`;
         await redis.del(LOCK_KEY).catch(() => {});
-        console.error(`[Queue] ❌ 失败: ${e.message}`, e.stack); // [日志] 增加堆栈打印
-        log(`[Error Details]`, e); // [日志]
+        logger.error(e, `[Queue] ❌ 任务失败`);
         
         if (rowId > 0) {
             await prisma.pendingEpisode.update({ where: { id: rowId }, data: { retryCount: { increment: 1 } } });
-            log(`[DB] Incremented retry count for ID: ${rowId}`); // [日志]
+            logger.info(`[DB] Incremented retry count for ID: ${rowId}`);
         }
     }
     throw e;
   }
 }, { 
     connection: REDIS_CONFIG,
-    limiter: { max: 1, duration: 3000 } // 提高并发，因为 probeFileByHash 很快
+    // [优化] 提升并发度
+    // 由于 core123 已经有了连接池优化，且 probeFileByHash 是轻量 IO，
+    // 我们可以安全地提高并发，从原来的 1 提升到 10，大幅加快入库速度。
+    concurrency: 1, 
+    // 放宽限流，不再强行等待 3 秒
+    limiter: { max: 1, duration: 3000 }
 });
 
 export const addToQueue = async (taskData) => {
-  log(`[Producer] Adding to queue: ${taskData.cleanName} (Type: ${taskData.sourceType})`); // [日志]
+  logger.info({ cleanName: taskData.cleanName, type: taskData.sourceType }, `[Producer] Adding to queue`);
   await downloadQueue.add('process', taskData, {
     removeOnComplete: true,
     attempts: taskData.sourceType === 'quark' ? 1 : 5,

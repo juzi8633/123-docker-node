@@ -7,6 +7,33 @@ dotenv.config();
 
 export const prisma = new PrismaClient();
 
+// =========================================================================
+// [优化] 1. 数据库层面：开启 WAL 模式与性能调优
+// =========================================================================
+async function enableWalMode() {
+    try {
+        // 开启 WAL 模式 (允许并发读写，消除锁表阻塞)
+        await prisma.$executeRawUnsafe('PRAGMA journal_mode = WAL;');
+        
+        // 降低磁盘同步频率 (synchronous=NORMAL 在保证数据库损坏率极低的前提下，大幅提升写入速度)
+        await prisma.$executeRawUnsafe('PRAGMA synchronous = NORMAL;');
+        
+        // 将临时表存储在内存中 (减少频繁的磁盘 IO)
+        await prisma.$executeRawUnsafe('PRAGMA temp_store = MEMORY;');
+        
+        // 增加缓存大小 (单位为页，负数表示字节，-64000 约等于 64MB)
+        await prisma.$executeRawUnsafe('PRAGMA cache_size = -64000;'); 
+        
+        console.log('[DB] ✅ Prisma SQLite Performance Mode Enabled (WAL + Normal Sync)');
+    } catch (e) {
+        console.error('[DB] ❌ Failed to enable WAL for Prisma:', e);
+    }
+}
+
+// 立即执行优化 (Promise 可能会在稍后完成，但在高并发到来前通常已就绪)
+enableWalMode();
+// =========================================================================
+
 // === 路径修正逻辑 ===
 // 1. 获取 .env 中的路径
 let dbPath = process.env.DATABASE_URL.replace('file:', '');
@@ -28,7 +55,10 @@ if (!fs.existsSync(dir)) {
 
 // 4. 初始化 SQLite
 const sqlite = new Database(dbPath);
+// [优化] 同步 better-sqlite3 的性能设置
 sqlite.pragma('journal_mode = WAL');
+sqlite.pragma('synchronous = NORMAL');
+sqlite.pragma('temp_store = MEMORY');
 
 // === D1 API 适配器 (保持不变) ===
 class D1PreparedStatement {

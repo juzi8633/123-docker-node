@@ -1,30 +1,27 @@
 import { prisma } from '../src/db.js';
 import { strmService } from '../src/services/strm.js';
 import { fileURLToPath } from 'url';
+import { createLogger } from '../src/logger.js'; // [优化] 引入日志模块
 
-// [新增] 简易日志工具
-function log(msg) {
-    const time = new Date().toISOString().split('T')[1].split('.')[0];
-    const prefix = `[SyncStrm ${time}]`;
-    console.log(`${prefix} ${msg}`);
-}
+// [优化] 初始化模块专用日志
+const logger = createLogger('SyncStrm');
 
 // 封装为主函数，供 API 调用
 export async function runSyncStrm() {
-    log('🚀 [Start] 开始全量同步 strm 文件...');
+    logger.info('🚀 [Start] 开始全量同步 strm 文件...');
     const startTime = Date.now();
 
     try {
         // 1. 初始化
-        log('[Init] 正在初始化 StrmService...');
+        logger.info('[Init] 正在初始化 StrmService...');
         await strmService.init();
 
         // 2. 获取总数
         const total = await prisma.seriesEpisode.count();
-        log(`📊 [Stats] 数据库中共有 ${total} 个媒体文件待处理`);
+        logger.info({ total }, `📊 [Stats] 数据库中共有 ${total} 个媒体文件待处理`);
 
         if (total === 0) {
-            log('[End] 数据库为空，无需同步');
+            logger.info('[End] 数据库为空，无需同步');
             return { success: true, message: "数据库为空" };
         }
 
@@ -36,7 +33,7 @@ export async function runSyncStrm() {
         // 使用 while(true) 配合 break，基于 ID 游标遍历
         while (true) {
             batchCount++;
-            // log(`[Batch ${batchCount}] 正在获取数据 (LastID: ${lastId}, Limit: ${BATCH_SIZE})...`);
+            // logger.debug({ batchCount, lastId, limit: BATCH_SIZE }, `正在获取数据...`);
 
             // [优化] Cursor-based Pagination
             // 不再使用 skip，而是使用 where id > lastId
@@ -51,14 +48,13 @@ export async function runSyncStrm() {
             });
 
             if (episodes.length === 0) {
-                log(`[Batch ${batchCount}] 未获取到更多数据，循环结束`);
+                logger.info(`[Batch ${batchCount}] 未获取到更多数据，循环结束`);
                 break;
             }
 
             const currentBatchFirst = episodes[0].id;
             const currentBatchLast = episodes[episodes.length - 1].id;
-            // log(`[Batch ${batchCount}] 获取到 ${episodes.length} 条 (ID范围: ${currentBatchFirst} - ${currentBatchLast})`);
-
+            
             const batchStart = Date.now();
 
             // 并发执行
@@ -73,7 +69,13 @@ export async function runSyncStrm() {
             lastId = currentBatchLast;
             
             // 打印批次日志 (每批次打印一次，避免刷屏)
-            log(`[Progress] 批次 ${batchCount} 完成 | 本批 ${episodes.length} 条 | 耗时 ${batchDuration}ms | ID进度 ${currentBatchLast} | 总进度 ${processed}/${total}`);
+            logger.info({ 
+                batch: batchCount, 
+                count: episodes.length, 
+                durationMs: batchDuration, 
+                idRange: `${currentBatchFirst}-${currentBatchLast}`,
+                progress: `${processed}/${total}`
+            }, `[Progress] 批次完成`);
 
             // 只有在命令行运行时才打印进度条 (视觉效果)
             if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -92,9 +94,8 @@ export async function runSyncStrm() {
             process.stdout.write('\n');
         }
 
-        log(`🎉 [Done] 同步完成!`);
-        log(`📈 [Report] 总耗时: ${durationSec}s | 处理总数: ${processed} | 平均速度: ${speed} 个/秒`);
-
+        logger.info({ durationSec, processed, speed }, `🎉 [Done] 同步完成`);
+        
         return { 
             success: true, 
             processed, 
@@ -103,9 +104,8 @@ export async function runSyncStrm() {
         };
 
     } catch (e) {
-        console.error('\n'); // 确保错误日志另起一行
-        console.error(`❌ [Error] 同步过程发生异常:`, e);
-        log(`❌ [Error] 异常堆栈: ${e.message}`);
+        if (process.argv[1] === fileURLToPath(import.meta.url)) console.error('\n'); // 确保错误日志另起一行
+        logger.error(e, `❌ [Error] 同步过程发生异常`);
         throw e;
     }
 }
@@ -115,7 +115,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     runSyncStrm()
         .then(() => process.exit(0))
         .catch((e) => {
-            console.error(e);
+            // logger.error 已在 catch 中处理，这里只需退出
             process.exit(1);
         });
 }

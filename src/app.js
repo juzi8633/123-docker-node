@@ -11,6 +11,7 @@ import { prisma } from './db.js';
 import redis from './redis.js';
 import { core123 } from './services/core123.js';
 import { strmService } from './services/strm.js'; 
+import { createLogger } from './logger.js'; // [优化] 引入日志模块
 
 // 引入管理脚本逻辑
 import { runSyncStrm } from '../scripts/sync_strm.js';
@@ -36,26 +37,13 @@ BigInt.prototype.toJSON = function () { return this.toString(); };
 
 dotenv.config();
 
-// [新增] 简易日志工具
-function log(msg, data = null) {
-    const time = new Date().toISOString().split('T')[1].split('.')[0];
-    const prefix = `[App ${time}]`;
-    if (data) {
-        try {
-            const str = JSON.stringify(data, null, 2);
-            console.log(`${prefix} ${msg}`, str.length > 1000 ? str.substring(0, 1000) + '... (truncated)' : str);
-        } catch (e) {
-            console.log(`${prefix} ${msg} [Object]`);
-        }
-    } else {
-        console.log(`${prefix} ${msg}`);
-    }
-}
+// [优化] 初始化高性能日志
+const logger = createLogger('App');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = Fastify({ 
-    logger: true,
+    logger: true, // Fastify 默认日志也开启，用于记录 HTTP 请求详情
     bodyLimit: 50 * 1024 * 1024
 });
 
@@ -73,14 +61,14 @@ let isMaintenanceRunning = false;
 
 app.addHook('onReady', async () => {
     try {
-        log('正在检查 Redis 连接...');
+        logger.info('正在检查 Redis 连接...');
         await redis.ping();
         
-        log('正在检查数据库连接...');
+        logger.info('正在检查数据库连接...');
         await prisma.$queryRaw`SELECT 1`; 
         
         if (core123.reloadConfig) {
-            log('触发 Core123 配置预加载...');
+            logger.info('触发 Core123 配置预加载...');
             await core123.reloadConfig();
             app.log.info('✅ [System] Core123 配置已加载');
         }
@@ -89,9 +77,9 @@ app.addHook('onReady', async () => {
         await strmService.init();
 
         app.log.info('✅ [System] Redis & SQLite 连接成功');
-        log('系统启动完成');
+        logger.info('系统启动完成');
     } catch (err) {
-        app.log.error('❌ [System] 启动失败:', err);
+        app.log.error(err, '❌ [System] 启动失败');
         process.exit(1);
     }
 });
@@ -114,11 +102,11 @@ app.get('/api/play/stream', async (req, reply) => {
     const { hash, size, name } = req.query;
 
     if (!hash || !size || !name) {
-        log(`[Play] ❌ 参数缺失: Hash/Size/Name 必须提供`);
+        logger.warn(`[Play] ❌ 参数缺失: Hash/Size/Name 必须提供`);
         return reply.code(400).send("Missing hash, size or name params");
     }
 
-    log(`[Play] 收到无状态播放请求: ${name} (Hash:${hash}, Size:${size})`);
+    logger.info({ hash, size, name }, `[Play] 收到无状态播放请求: ${name}`);
 
     try {
         // 直接调用 core123，不查数据库
@@ -131,10 +119,10 @@ app.get('/api/play/stream', async (req, reply) => {
 
         if (!downloadUrl) throw new Error("Link generation failed");
         
-        log(`[Play] ✅ 获取直链成功 (无状态模式)，执行 302 跳转`);
+        logger.info(`[Play] ✅ 获取直链成功 (无状态模式)，执行 302 跳转`);
         return reply.redirect(302, downloadUrl);
     } catch (e) {
-        log(`[Play] ❌ 获取直链失败: ${e.message}`);
+        logger.error(e, `[Play] ❌ 获取直链失败`);
         return reply.code(502).send("Upstream Error");
     }
 });
@@ -145,7 +133,7 @@ app.get('/api/play/:id', async (req, reply) => {
     // 防止 stream 被误识别为 id
     if (id === 'stream') return; 
 
-    log(`[Play] 收到 ID 播放请求: ${id}`);
+    logger.info({ id }, `[Play] 收到 ID 播放请求`);
     
     const file = await prisma.seriesEpisode.findUnique({
         where: { id: parseInt(id) },
@@ -153,17 +141,19 @@ app.get('/api/play/:id', async (req, reply) => {
     });
     
     if (!file) {
-        log(`[Play] ❌ 数据库中未找到文件 ID: ${id}`);
+        logger.warn({ id }, `[Play] ❌ 数据库中未找到文件`);
         return reply.code(404).send("File not found in DB");
     }
 
     try {
         const downloadUrl = await core123.getDownloadUrlByHash(file.cleanName, file.etag, Number(file.size));
         if (!downloadUrl) throw new Error("Link generation failed");
-        log(`[Play] ✅ 获取直链成功 (ID模式)，执行 302 跳转`);
+        logger.info(`[Play] ✅ 获取直链成功 (ID模式)，执行 302 跳转`);
+        reply.header('CDN-Cache-Control', 'public, max-age=432000'); 
+        reply.header('Cache-Control', 'public, max-age=3600');
         return reply.redirect(302, downloadUrl);
     } catch (e) {
-        log(`[Play] ❌ ID模式失败: ${e.message}`);
+        logger.error(e, `[Play] ❌ ID模式失败`);
         return reply.code(502).send("Upstream Error");
     }
 });
@@ -235,7 +225,7 @@ app.get('/api/config', async (req, reply) => {
 });
 
 app.post('/api/config', async (req, reply) => {
-    log('[Config] 收到配置保存请求');
+    logger.info('[Config] 收到配置保存请求');
     const { configs } = req.body;
     if (!configs || typeof configs !== 'object') return reply.code(400).send({ success: false, message: "Invalid config object" });
 
@@ -248,27 +238,27 @@ app.post('/api/config', async (req, reply) => {
             });
         });
         await prisma.$transaction(operations);
-        log('[Config] 数据库配置更新成功');
+        logger.info('[Config] 数据库配置更新成功');
 
         if (configs.hasOwnProperty('cloud189_token')) {
             const token = configs.cloud189_token;
             if (token && token.trim()) {
                 await redis.set('auth:189:token', token.trim());
-                log('[Config] 189 Token 已同步到 Redis');
+                logger.info('[Config] 189 Token 已同步到 Redis');
             } else {
                 await redis.del('auth:189:token');
-                log('[Config] 189 Token 已从 Redis 移除');
+                logger.info('[Config] 189 Token 已从 Redis 移除');
             }
         }
 
         if (core123.reloadConfig) {
             await core123.reloadConfig();
-            log('[Config] Core123 服务已热重载');
+            logger.info('[Config] Core123 服务已热重载');
         }
         metaCache.clear();
         return { success: true };
     } catch (e) {
-        log(`[Config] ❌ 保存失败: ${e.message}`);
+        logger.error(e, `[Config] ❌ 保存失败`);
         return reply.code(500).send({ success: false, message: e.message });
     }
 });
@@ -323,13 +313,13 @@ app.post('/api/do/', async (req, reply) => {
     return { success: false, message: `Unknown action: ${action}` };
 });
 
-async function handleMetadataMigration(newData, logger) {
+async function handleMetadataMigration(newData, reqLogger) {
     const { tmdbId, name, year, genres, originalLanguage, originCountry } = newData;
     const oldSeries = await prisma.seriesMain.findUnique({ where: { tmdbId }, include: { episodes: true } });
     if (!oldSeries) return false;
     const isChanged = oldSeries.name !== name || oldSeries.year !== year || oldSeries.originalLanguage !== originalLanguage || oldSeries.originCountry !== originCountry || oldSeries.genres !== genres;
     if (isChanged) {
-        log(`[Migration] 元数据变更 (TMDB:${tmdbId})，清理旧 STRM...`);
+        logger.info({ tmdbId }, `[Migration] 元数据变更，清理旧 STRM...`);
         for (const ep of oldSeries.episodes) await strmService.deleteEpisode({ ...ep, series: oldSeries });
         return true; 
     }
@@ -342,14 +332,15 @@ app.post('/api/submit', async (req, reply) => {
     const nowTime = new Date();
     const nowTimeISO = nowTime.toISOString();
     const fileCount = jsonData?.files?.length || 0;
-    log(`[Submit] 📥 收到入库请求: ${seriesName} (Files: ${fileCount}, Source: ${sourceType})`);
+    
+    logger.info({ seriesName, fileCount, sourceType }, `[Submit] 📥 收到入库请求`);
 
     try {
         const needRegenerateAll = await handleMetadataMigration({ tmdbId, name: seriesName, year: seriesYear, genres, originalLanguage, originCountry }, req.log);
         let createdEpisodeIds = [];
 
         await prisma.$transaction(async (tx) => {
-            log('[Submit] 开始数据库事务 (Main & Episode)...');
+            logger.info('[Submit] 开始数据库事务 (Main & Episode)...');
             await tx.$executeRaw`
                 INSERT INTO series_main (tmdb_id, name, year, type, genres, original_language, origin_country, last_updated) 
                 VALUES (${tmdbId}, ${seriesName}, ${seriesYear}, ${type}, ${genres}, ${originalLanguage}, ${originCountry}, ${nowTimeISO})
@@ -375,7 +366,7 @@ app.post('/api/submit', async (req, reply) => {
                 }
             } else {
                  req.log.info('[Submit] >>> 进入 [待验证] 分支...');
-                 log('[Submit] 进入待验证队列 (Worker Flow)...');
+                 logger.info('[Submit] 进入待验证队列 (Worker Flow)...');
                  for (const file of jsonData.files) {
                     const { season, episode } = parseSeasonEpisode(file.clean_name, type);
                     const pending = await prisma.pendingEpisode.create({
@@ -392,20 +383,20 @@ app.post('/api/submit', async (req, reply) => {
                 }
             }
         }, { maxWait: 20000, timeout: 60000 }); 
-        log('[Submit] ✅ 数据库事务已提交');
+        logger.info('[Submit] ✅ 数据库事务已提交');
 
         if (isSourceTrusted && createdEpisodeIds.length > 0) {
-            log(`[Submit] 🛠️ 开始生成 STRM 文件 (${createdEpisodeIds.length} 个)...`);
+            logger.info({ count: createdEpisodeIds.length }, `[Submit] 🛠️ 开始生成 STRM 文件`);
             let successCount = 0;
             let failCount = 0;
             for (const id of createdEpisodeIds) {
                 try { await strmService.syncEpisode(id); successCount++; } catch (err) { failCount++; }
             }
-            log(`[Submit] STRM 生成完毕: 成功 ${successCount}, 失败 ${failCount}`);
+            logger.info({ successCount, failCount }, `[Submit] STRM 生成完毕`);
         }
 
         if (needRegenerateAll) {
-            log(`[Migration] 🔄 重新生成全剧 STRM...`);
+            logger.info(`[Migration] 🔄 重新生成全剧 STRM...`);
             const allEps = await prisma.seriesEpisode.findMany({ where: { tmdbId } });
             for (const ep of allEps) await strmService.syncEpisode(ep.id).catch(e => {});
         }
@@ -414,7 +405,7 @@ app.post('/api/submit', async (req, reply) => {
         if (!isSourceTrusted) pendingCount = fileCount;
         return { success: true, pendingCount };
     } catch (e) {
-        log(`[Submit] ❌ 提交处理失败: ${e.message}`);
+        logger.error(e, `[Submit] ❌ 提交处理失败`);
         return reply.code(500).send({ success: false, error: e.message });
     }
 });
@@ -449,7 +440,8 @@ app.delete('/api/delete/episode', async (req, reply) => {
 
 app.post('/api/webhook/upload', async (req, reply) => {
     const { secret, file_name, path, etag, size } = req.body;
-    log(`[Webhook] 收到上传通知: ${file_name} (Size: ${size})`);
+    logger.info({ file_name, size }, `[Webhook] 收到上传通知`);
+    
     if (secret !== CALLBACK_SECRET) return reply.code(403).send({ error: 'Invalid Secret' });
     if (!file_name || !etag) return { status: 'error', message: 'Missing fields' };
     const tmdbMatch = file_name.match(RE_TMDB_TAG) || path.match(RE_TMDB_TAG);
@@ -492,7 +484,7 @@ app.post('/api/webhook/upload', async (req, reply) => {
         newScore = calculateScore(analysis, size, mediaType === 'movie');
         const currentEp = await prisma.seriesEpisode.findFirst({ where: { tmdbId, season, episode, type: { not: 'subtitle' } } });
         if (currentEp && newScore <= currentEp.score) {
-            log(`[Webhook] ⏭️ 分数较低，跳过覆盖`);
+            logger.info(`[Webhook] ⏭️ 分数较低，跳过覆盖`);
             return { status: 'skipped', reason: 'lower_score' };
         }
     }
@@ -512,7 +504,7 @@ app.post('/api/webhook/upload', async (req, reply) => {
 
 app.get('/api/stream', async (req, reply) => {
     const { panType, shareUrl, sharePassword, cookie } = req.query;
-    log(`[Stream] 收到解析请求: ${panType}, URL: ${shareUrl}`);
+    logger.info({ panType, shareUrl }, `[Stream] 收到解析请求`);
     const stream = new Readable({ read() {} });
     reply.raw.writeHead(200, {
         'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*'
@@ -530,9 +522,9 @@ app.get('/api/stream', async (req, reply) => {
         else if (panType === '189') await create189RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === 'quark') await createQuarkRapidTransfer(shareUrl, sharePassword, cookie, writer);
         else throw new Error(`不支持的网盘类型: ${panType}`);
-        log(`[Stream] 解析完成`);
+        logger.info(`[Stream] 解析完成`);
     } catch (e) {
-        log(`[Stream] ❌ 解析异常: ${e.message}`);
+        logger.error(e, `[Stream] ❌ 解析异常`);
         stream.push(`data: ${JSON.stringify({ type: 'error', data: { message: e.message } })}\n\n`);
     } finally {
         writer.close();
@@ -543,13 +535,13 @@ app.post('/api/callback/123', async (req, reply) => {
     const { id, key } = req.query;
     if (key !== CALLBACK_SECRET) return reply.code(403).send("Forbidden");
     const body = req.body;
-    log(`[Callback] 收到 123 离线下载回调 (ID:${id}, Status:${body.status})`);
+    logger.info({ id, status: body.status }, `[Callback] 收到 123 离线下载回调`);
     await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
     return { code: 0 };
 });
 
 setInterval(() => {
-    core123.recycleAllCacheFolders().catch(err => { console.error('❌ [Schedule] Daily cleanup failed:', err); });
+    core123.recycleAllCacheFolders().catch(err => { logger.error(err, '❌ [Schedule] Daily cleanup failed'); });
 }, 24 * 60 * 60 * 1000);
 
 async function fetchTmdbMeta(id, type) {
@@ -589,7 +581,7 @@ app.setNotFoundHandler((req, reply) => {
 const start = async () => {
     try {
         await app.listen({ port: 3000, host: '0.0.0.0' });
-        log('🚀 服务已启动 http://localhost:3000');
+        logger.info('🚀 服务已启动 http://localhost:3000');
     } catch (err) {
         app.log.error(err);
         process.exit(1);

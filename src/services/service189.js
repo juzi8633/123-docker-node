@@ -1,16 +1,21 @@
+// src/services/service189.js
 import crypto from 'node:crypto'; // [新增] 引入 Node 原生 crypto 模块
+import { createLogger } from '../logger.js'; // [优化] 引入日志模块
 
 /**
  * 189网盘秒传服务
  */
 
+// [优化] 初始化模块专用日志
+const logger = createLogger('Service189');
+
 async function sendEvent(writer, type, data) {
   try {
-    const encoder = new TextEncoder();
     // 适配 Fastify writer 和流式响应
     await writer.write(`data: ${JSON.stringify({ type, data })}\n\n`);
   } catch (e) {
-    // Suppress errors on closed streams
+    // Suppress errors on closed streams (保持原有逻辑，不打印 SSE 断开的噪音)
+    // 如果需要调试，可以使用 logger.debug(e, 'SSE Write Error');
   }
 }
 
@@ -29,6 +34,7 @@ async function fetchAsUtf8(url, options) {
  * @param {object} writer - Stream writer for sending events
  */
 export async function create189RapidTransfer(shareUrl, sharePwd, writer) {
+  logger.info({ shareUrl }, "开始解析189分享链接"); // [新增] 入口日志
   await sendEvent(writer, 'phase', { message: '正在解析分享链接...' });
   
   let match = shareUrl.match(/\/t\/([a-zA-Z0-9]+)/) || shareUrl.match(/[?&]code=([a-zA-Z0-9]+)/);
@@ -66,6 +72,7 @@ export async function create189RapidTransfer(shareUrl, sharePwd, writer) {
 
   if (data.res_code !== 0) {
     if (data.res_code === 40401 && !sharePwd) throw new Error("该分享需要提取码");
+    logger.warn({ code: data.res_code, msg: data.res_message }, "获取分享信息失败");
     throw new Error(`获取分享信息失败: ${data.res_message || "未知错误"}`);
   }
 
@@ -91,6 +98,8 @@ export async function create189RapidTransfer(shareUrl, sharePwd, writer) {
       });
       await sendEvent(writer, 'scan', { count: 1 });
   }
+
+  logger.info({ count: files.length }, "扫描完成");
 
   const finalJson = {
     scriptVersion: "3.0.3",
@@ -122,12 +131,14 @@ async function get189ShareFiles(shareId, shareDirFileId, fileId, path = "", shar
         const fixedText = text.replace(/"(id|fileId|parentId|shareId)":(\d{15,})/g, '"$1":"$2"');
         data = JSON.parse(fixedText);
     } catch(e) { 
-        console.error("Failed to parse 189 file list:", e);
+        logger.error(e, "Failed to parse 189 file list");
         break; 
     }
 
     if (data.res_code !== 0) {
-        if (data.res_code === "FileNotFound" && path) console.warn(`[189] 子文件夹 "${path}" 访问失败`);
+        if (data.res_code === "FileNotFound" && path) {
+            logger.warn({ path }, "子文件夹访问失败");
+        }
         break;
     }
 

@@ -1,7 +1,24 @@
+// src/services/core123.js
 import redis from '../redis.js';
 import { prisma } from '../db.js'; // [新增] 引入数据库客户端
 import dotenv from 'dotenv';
+import { setGlobalDispatcher, Agent } from 'undici'; // [优化] 引入高性能 HTTP 客户端核心
+import { LRUCache } from 'lru-cache'; // [优化] 引入 LRU 缓存库
 dotenv.config();
+
+// =========================================================================
+// [优化] 2. 网络层面：配置全局 HTTP 连接池
+// =========================================================================
+const agent = new Agent({
+    keepAliveTimeout: 15000, // 保持连接 15秒，复用 TCP
+    connections: 200,        // 最大并发连接数 (大幅提升秒传探测并发能力)
+    pipelining: 1,           // HTTP/1.1 流水线
+    connect: {
+        timeout: 10000       // 连接超时 10秒
+    }
+});
+setGlobalDispatcher(agent); // 应用到全局 fetch
+// =========================================================================
 
 // [新增] 简易日志工具 (仅用于打印，不影响业务)
 function log(msg, data = null) {
@@ -20,7 +37,15 @@ function log(msg, data = null) {
     }
 }
 
-const memoryCache = new Map();
+// =========================================================================
+// [优化] 3. 缓存层面：使用 LRU 替代原生 Map，防止内存溢出
+// =========================================================================
+const memoryCache = new LRUCache({
+    max: 1000,             // 最多缓存 1000 个 Token/Key
+    ttl: 1000 * 60 * 60,   // 内存缓存 1 小时 (Redis 依然负责持久化)
+});
+
+// inflightRequests 用于请求去重，生命周期短，自清理，保持 Map 即可
 const inflightRequests = new Map();
 
 export class Core123Service {
@@ -115,6 +140,7 @@ export class Core123Service {
     };
     try {
         // log(`[API Request] ${options.method || 'GET'} ${url}`); // [日志] 可选开启
+        // 由于设置了全局 Agent，这里的 fetch 会自动使用连接池
         const res = await fetch(url, { ...options, headers: optimizedHeaders });
         if (!res.ok) {
             const text = await res.text();
@@ -135,7 +161,9 @@ export class Core123Service {
     }
 
     const cacheKey = `${this.KEY_TOKEN_PREFIX}${account.id}`;
+    // [优化] 使用 LRUCache API
     if (memoryCache.has(cacheKey)) return memoryCache.get(cacheKey);
+    
     const cached = await redis.get(cacheKey);
     if (cached) {
         memoryCache.set(cacheKey, cached);
@@ -229,7 +257,7 @@ export class Core123Service {
       if (createRes.code === 0) {
           dirID = createRes.data.dirID;
           log(`[Dir] Created new folder ID: ${dirID}`); // [日志]
-      } else if (createRes.code === 4025 || createRes.message.includes("exist")) {
+      } else if (createRes.code === 4025 || createRes.code === 1 || createRes.message.includes("exist") || createRes.message.includes("同名")) {
           // 已存在，反查 ID
           log(`[Dir] Folder exists, searching ID...`); // [日志]
           const listRes = await this.fetchJson(`${this.domain}/api/v1/file/list?parentFileId=${parentId}&page=1&limit=100`, {
