@@ -67,7 +67,63 @@ class StrmService {
         }
     }
 
-    // 核心：同步单个 Episode (生成 strm/字幕)
+    // [拆分逻辑] 1. 视频同步专用 (无网络请求，极速)
+    async syncVideo(ep) {
+        try {
+            const { fullDir, fullPath, playUrl } = this.prepareSyncData(ep);
+            if (!playUrl) return; // 防御性编程
+
+            await fs.mkdir(fullDir, { recursive: true });
+            await fs.writeFile(fullPath, playUrl, 'utf8');
+            // logger.debug({ file: path.basename(fullPath) }, `[Video] ✅ STRM 生成完毕`);
+        } catch (e) {
+            logger.error(e, `[Video] ❌ 生成失败 ID:${ep.id}`);
+            throw e; // 抛出异常供调用方统计
+        }
+    }
+
+    // [拆分逻辑] 2. 字幕同步专用 (有网络请求，需外部流控)
+    async syncSubtitle(ep) {
+        try {
+            const { fullDir, fullPath, isSubtitle } = this.prepareSyncData(ep);
+            if (!isSubtitle) return;
+
+            await fs.mkdir(fullDir, { recursive: true });
+
+            logger.debug({ name: ep.cleanName }, `[Sub] 正在获取字幕直链...`);
+            let downloadUrl = "";
+            try {
+                // 调用 core123 获取下载链接
+                downloadUrl = await core123.getDownloadUrlByHash(ep.cleanName, ep.etag, Number(ep.size));
+            } catch (err) {
+                logger.error(err, `[Sub] ❌ 字幕直链获取失败`);
+                return false; 
+            }
+
+            if (!downloadUrl) return false;
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000); 
+            try {
+                const res = await fetch(downloadUrl, { signal: controller.signal });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const buffer = await res.arrayBuffer();
+                await fs.writeFile(fullPath, Buffer.from(buffer));
+                logger.info({ size: buffer.byteLength }, `[Sub] ✅ 字幕下载成功`);
+                return true;
+            } catch (fetchErr) {
+                logger.error(fetchErr, `[Sub] ❌ 字幕下载失败`);
+                throw fetchErr;
+            } finally {
+                clearTimeout(timeout);
+            }
+        } catch (e) {
+            logger.error(e, `[Sub] ❌ 字幕处理异常 (ID:${ep.id})`);
+            return false;
+        }
+    }
+
+    // [保持兼容] 统一入口 (供 app.js 使用)
     async syncEpisode(episodeId) {
         const ep = await prisma.seriesEpisode.findUnique({
             where: { id: episodeId },
@@ -79,58 +135,32 @@ class StrmService {
             return;
         }
 
+        logger.info({ fileName: ep.cleanName, id: ep.id, type: ep.type }, `[Sync] 处理单文件`);
+
+        try {
+            if (ep.type === 'subtitle') {
+                await this.syncSubtitle(ep);
+            } else {
+                await this.syncVideo(ep);
+            }
+            await scheduleEmbyScan();
+        } catch (e) {
+            logger.error(e, `[Sync] ❌ 同步异常 (ID:${episodeId})`);
+        }
+    }
+
+    // [新增] 辅助函数：统一准备路径和内容数据
+    prepareSyncData(ep) {
         const { dirPath, fileName, isSubtitle } = this.calculatePath(ep);
         const fullDir = path.join(STRM_ROOT, dirPath);
         const fullPath = path.join(fullDir, fileName);
 
-        logger.info({ fileName, id: ep.id, type: ep.type }, `[Sync] 处理文件`);
-
-        try {
-            await fs.mkdir(fullDir, { recursive: true });
-
-            if (isSubtitle) {
-                logger.debug(`[Sync] 📥 正在下载字幕内容...`);
-                let downloadUrl = "";
-                try {
-                    // 调用 core123 获取下载链接
-                    downloadUrl = await core123.getDownloadUrlByHash(ep.cleanName, ep.etag, Number(ep.size));
-                } catch (err) {
-                    logger.error(err, `[Sync] ❌ 字幕直链获取失败`);
-                    return; 
-                }
-
-                if (!downloadUrl) return;
-
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 15000); 
-                try {
-                    const res = await fetch(downloadUrl, { signal: controller.signal });
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    const buffer = await res.arrayBuffer();
-                    await fs.writeFile(fullPath, Buffer.from(buffer));
-                    logger.info({ size: buffer.byteLength }, `[Sync] ✅ 字幕写入成功`);
-                } catch (fetchErr) {
-                    logger.error(fetchErr, `[Sync] ❌ 字幕下载失败`);
-                    throw fetchErr;
-                } finally {
-                    clearTimeout(timeout);
-                }
-            } else {
-                // =========================================================
-                // [保持核心] 使用通用播放链接 (Hash + Size + Name)
-                // 不再依赖数据库 ID
-                // =========================================================
-                const encodedName = encodeURIComponent(ep.cleanName);
-                const playUrl = `${HOST_URL}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}`;
-                await fs.writeFile(fullPath, playUrl, 'utf8');
-                // logger.debug({ fullPath }, `[Sync] ✅ STRM 写入成功`);
-            }
-
-            await scheduleEmbyScan();
-
-        } catch (e) {
-            logger.error(e, `[Sync] ❌ 同步异常 (ID:${episodeId})`);
+        let playUrl = null;
+        if (!isSubtitle) {
+            const encodedName = encodeURIComponent(ep.cleanName);
+            playUrl = `${HOST_URL}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}`;
         }
+        return { fullDir, fullPath, isSubtitle, playUrl };
     }
 
     async deleteEpisode(ep) {
@@ -159,7 +189,7 @@ class StrmService {
     }
 
     // =========================================================================
-    // [核心修改] 路径计算：严格按照指定分类方案
+    // [核心修改] 路径计算：严格修复电影/剧集分类逻辑
     // =========================================================================
     calculatePath(ep) {
         const { series } = ep;
@@ -171,6 +201,7 @@ class StrmService {
 
         const isAnimation = series.genres && (series.genres.includes('16') || series.genres.includes('动画'));
         
+        // [修复] 逻辑分支：先定 Root，再定 Sub
         if (type === 'movie') {
             rootFolder = '电影';
             
@@ -184,7 +215,7 @@ class StrmService {
             }
 
         } else {
-            // [TV] 国漫 = 日番 = 纪录片 = 儿童 = 综艺 = 国产剧 = 欧美剧 = 日韩剧 = 未分类
+            // [TV] 
             rootFolder = '电视剧';
             
             // 1. 动画优先判断 (国漫/日番)
@@ -214,26 +245,35 @@ class StrmService {
         }
 
         const yearStr = series.year || 'Unknown';
-        const seriesNameSafe = series.name.replace(/[\\/:*?"<>|]/g, "_");
+        const seriesNameSafe = series.name.replace(/[\\/:*?"<>|]/g, "_").trim();
         const seriesFolder = `${seriesNameSafe} (${yearStr}) {tmdb-${series.tmdbId}}`;
 
         const isSubtitle = ep.type === 'subtitle';
         let ext = '.strm'; 
         if (isSubtitle) {
+            // 保留原始字幕后缀
             const match = ep.cleanName.match(/(\.(srt|ass|ssa|vtt|sub))$/i);
             ext = match ? match[0] : '.srt'; 
         }
 
+        // 去除视频/字幕后缀，作为基础文件名
         const baseName = ep.cleanName.replace(/\.(mp4|mkv|avi|strm|srt|ass|ssa|vtt)$/i, "");
         const fileName = `${baseName}${ext}`;
 
         let finalDir = "";
         
+        // [关键修复] 严格区分目录结构
         if (type === 'movie') {
+            // 电影：直接放在系列文件夹下，没有 Season 目录
+            // 路径: 电影/外语电影/Avatar (2009) {tmdb-xxx}/Avatar.strm
             finalDir = path.join(rootFolder, subFolder, seriesFolder);
         } else {
-            const s = String(ep.season).padStart(2, '0');
-            finalDir = path.join(rootFolder, subFolder, seriesFolder, `Season ${s}`);
+            // 剧集：必须放在 Season 目录下
+            // 路径: 电视剧/欧美剧/Breaking Bad (2008) {tmdb-xxx}/Season 01/Ep01.strm
+            // 处理 season 为 null 或 0 的情况
+            const sNum = (ep.season || 0);
+            const sStr = String(sNum).padStart(2, '0');
+            finalDir = path.join(rootFolder, subFolder, seriesFolder, `Season ${sStr}`);
         }
 
         return { dirPath: finalDir, fileName, isSubtitle };
@@ -264,6 +304,11 @@ class StrmService {
         } catch (e) {
             if (e.code !== 'ENOENT') logger.warn({ dir, msg: e.message }, '[Cleanup] ⚠️ 清理失败');
         }
+    }
+    
+    // [新增] 暴露给脚本手动触发扫描
+    async triggerScan() {
+        await scheduleEmbyScan();
     }
 }
 

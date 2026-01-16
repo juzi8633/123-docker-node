@@ -293,6 +293,37 @@ app.post('/api/admin/verify', async (req, reply) => {
 });
 
 // ==========================================
+// [新增] 数据库清空接口 (SeriesMain & SeriesEpisode)
+// ==========================================
+app.post('/api/admin/clear-db', async (req, reply) => {
+    logger.warn('[Admin] ⚠️ 收到清空媒体库请求 (Clear DB)...');
+    try {
+        // 使用事务确保同时清空，避免中间状态
+        const [epCount, mainCount] = await prisma.$transaction([
+            prisma.seriesEpisode.deleteMany(),
+            prisma.seriesMain.deleteMany()
+        ]);
+        
+        logger.info({ epCount: epCount.count, mainCount: mainCount.count }, '[Admin] ✅ 数据库媒体表已清空');
+        
+        // 清理内存中的元数据缓存
+        metaCache.clear();
+
+        return { 
+            success: true, 
+            message: "Library tables cleared. Please run 'Verify' to clean up physical files.",
+            stats: { 
+                episodesDeleted: epCount.count, 
+                seriesDeleted: mainCount.count 
+            }
+        };
+    } catch (e) {
+        logger.error(e, '[Admin] ❌ 清空数据库失败');
+        return reply.code(500).send({ success: false, error: e.message });
+    }
+});
+
+// ==========================================
 // [新增] 数据导入接口 (Docker 专用) - 增强健壮版
 // ==========================================
 app.post('/api/admin/import', async (req, reply) => {
