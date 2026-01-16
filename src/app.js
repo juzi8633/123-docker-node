@@ -324,7 +324,7 @@ app.post('/api/admin/clear-db', async (req, reply) => {
 });
 
 // ==========================================
-// [新增] 数据导入接口 (Docker 专用) - 增强健壮版
+// [新增] 数据导入接口 (Docker 专用) - 性能增强版
 // ==========================================
 app.post('/api/admin/import', async (req, reply) => {
     const { type } = req.query; // 'series' 或 'episode'
@@ -397,30 +397,45 @@ app.post('/api/admin/import', async (req, reply) => {
             const validData = dataList.filter(item => item.tmdb_id && item.clean_name && (item.size !== undefined && item.size !== null));
             logger.info(`[Import] 有效单集数据: ${validData.length} 条 (原始: ${dataList.length})`);
 
-            // 改用 try-catch 逐条插入，手动处理重复或错误
-            for (const item of validData) {
-                try {
-                    await prisma.seriesEpisode.create({
-                        data: {
-                            tmdbId: parseInt(item.tmdb_id),
-                            season: item.season || 0,
-                            episode: item.episode || 0,
-                            cleanName: item.clean_name,
-                            size: BigInt(item.size || 0),
-                            etag: item.etag,
-                            score: item.score || 0,
-                            type: item.type || 'video',
-                            createdAt: item.created_at ? new Date(item.created_at) : new Date()
+            // [核心优化] 批量插入 (Batch Insert)
+            const BATCH_SIZE = 500; // 每批 500 条
+            
+            for (let i = 0; i < validData.length; i += BATCH_SIZE) {
+                const batch = validData.slice(i, i + BATCH_SIZE);
+                
+                await prisma.$transaction(async (tx) => {
+                    for (const item of batch) {
+                        try {
+                            await tx.seriesEpisode.create({
+                                data: {
+                                    tmdbId: parseInt(item.tmdb_id),
+                                    season: item.season || 0,
+                                    episode: item.episode || 0,
+                                    cleanName: item.clean_name,
+                                    size: BigInt(item.size || 0),
+                                    etag: item.etag,
+                                    score: item.score || 0,
+                                    type: item.type || 'video',
+                                    createdAt: item.created_at ? new Date(item.created_at) : new Date()
+                                }
+                            });
+                        } catch (e) {
+                            // 忽略唯一性约束错误(重复数据)，其他错误记录日志
+                            if (!e.message.includes('Unique constraint')) {
+                                logger.warn(`[Import] 单集写入失败 (${item.clean_name}): ${e.message}`);
+                            }
                         }
-                    });
-                    count++;
-                } catch (e) {
-                    // 如果是 Unique constraint 错误 (重复数据)，忽略即可
-                    if (!e.message.includes('Unique constraint')) {
-                        logger.warn(`[Import] 单集写入失败 (${item.clean_name}): ${e.message}`);
                     }
+                });
+                
+                count += batch.length;
+                
+                // 进度日志：每 5000 条打印一次，或最后一批
+                if ((i + BATCH_SIZE) % 5000 === 0 || (i + BATCH_SIZE) >= validData.length) {
+                    logger.info(`[Import] 🚀 进度: ${Math.min(i + BATCH_SIZE, validData.length)} / ${validData.length}`);
                 }
             }
+
         } else {
             return reply.code(400).send({ error: "Invalid type" });
         }
