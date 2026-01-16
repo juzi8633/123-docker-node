@@ -293,7 +293,7 @@ app.post('/api/admin/verify', async (req, reply) => {
 });
 
 // ==========================================
-// [新增] 数据导入接口 (Docker 专用)
+// [新增] 数据导入接口 (Docker 专用) - 增强健壮版
 // ==========================================
 app.post('/api/admin/import', async (req, reply) => {
     const { type } = req.query; // 'series' 或 'episode'
@@ -321,59 +321,83 @@ app.post('/api/admin/import', async (req, reply) => {
 
     if (dataList.length === 0) return { success: false, message: "No valid data found" };
 
-    logger.info(`[Import] 解析到 ${dataList.length} 条数据，准备写入...`);
+    logger.info(`[Import] 解析到 ${dataList.length} 条原始数据，开始处理...`);
     let count = 0;
-    const BATCH_SIZE = 1000;
 
     try {
         if (type === 'series') {
-            const formatted = dataList.map(item => ({
-                tmdbId: item.tmdb_id,
-                name: item.name,
-                year: item.year || '',
-                type: item.type || 'tv',
-                genres: item.genres || '',
-                originalLanguage: item.originalLanguage || '',
-                originCountry: Array.isArray(item.originCountry) ? item.originCountry.join(',') : (item.originCountry || ''),
-                lastUpdated: new Date()
-            }));
+            // 1. 过滤无效数据
+            const validData = dataList.filter(item => item.tmdb_id && !isNaN(parseInt(item.tmdb_id)));
+            logger.info(`[Import] 有效剧集数据: ${validData.length} 条 (原始: ${dataList.length})`);
 
-            for (let i = 0; i < formatted.length; i += BATCH_SIZE) {
-                const batch = formatted.slice(i, i + BATCH_SIZE);
-                const res = await prisma.seriesMain.createMany({ data: batch, skipDuplicates: true });
-                count += res.count;
+            // 改用 upsert 逐条插入，避免 createMany 遇到重复报错
+            for (const item of validData) {
+                try {
+                    await prisma.seriesMain.upsert({
+                        where: { tmdbId: parseInt(item.tmdb_id) },
+                        update: {
+                            name: item.name,
+                            year: item.year || '',
+                            type: item.type || 'tv',
+                            genres: item.genres || '',
+                            originalLanguage: item.originalLanguage || '',
+                            originCountry: Array.isArray(item.originCountry) ? item.originCountry.join(',') : (item.originCountry || ''),
+                            lastUpdated: new Date()
+                        },
+                        create: {
+                            tmdbId: parseInt(item.tmdb_id),
+                            name: item.name,
+                            year: item.year || '',
+                            type: item.type || 'tv',
+                            genres: item.genres || '',
+                            originalLanguage: item.originalLanguage || '',
+                            originCountry: Array.isArray(item.originCountry) ? item.originCountry.join(',') : (item.originCountry || ''),
+                            lastUpdated: new Date()
+                        }
+                    });
+                    count++;
+                } catch (e) {
+                    logger.warn(`[Import] 单条剧集写入失败 (ID: ${item.tmdb_id}): ${e.message}`);
+                }
             }
 
         } else if (type === 'episode') {
-            const formatted = dataList.map(item => ({
-                tmdbId: item.tmdb_id,
-                season: item.season || 0,
-                episode: item.episode || 0,
-                cleanName: item.clean_name,
-                size: BigInt(item.size || 0),
-                etag: item.etag,
-                score: item.score || 0,
-                type: item.type || 'video',
-                createdAt: item.created_at ? new Date(item.created_at) : new Date()
-            }));
+            // 2. 过滤无效单集
+            const validData = dataList.filter(item => item.tmdb_id && item.clean_name && (item.size !== undefined && item.size !== null));
+            logger.info(`[Import] 有效单集数据: ${validData.length} 条 (原始: ${dataList.length})`);
 
-            for (let i = 0; i < formatted.length; i += BATCH_SIZE) {
-                const batch = formatted.slice(i, i + BATCH_SIZE);
+            // 改用 try-catch 逐条插入，手动处理重复或错误
+            for (const item of validData) {
                 try {
-                    const res = await prisma.seriesEpisode.createMany({ data: batch, skipDuplicates: true });
-                    count += res.count;
+                    await prisma.seriesEpisode.create({
+                        data: {
+                            tmdbId: parseInt(item.tmdb_id),
+                            season: item.season || 0,
+                            episode: item.episode || 0,
+                            cleanName: item.clean_name,
+                            size: BigInt(item.size || 0),
+                            etag: item.etag,
+                            score: item.score || 0,
+                            type: item.type || 'video',
+                            createdAt: item.created_at ? new Date(item.created_at) : new Date()
+                        }
+                    });
+                    count++;
                 } catch (e) {
-                    logger.warn(`批次导入失败: ${e.message}`);
+                    // 如果是 Unique constraint 错误 (重复数据)，忽略即可
+                    if (!e.message.includes('Unique constraint')) {
+                        logger.warn(`[Import] 单集写入失败 (${item.clean_name}): ${e.message}`);
+                    }
                 }
             }
         } else {
             return reply.code(400).send({ error: "Invalid type" });
         }
 
-        logger.info(`[Import] ✅ 导入成功，新增 ${count} 条`);
+        logger.info(`[Import] ✅ 导入完成，成功写入 ${count} 条记录`);
         return { success: true, count };
     } catch (e) {
-        logger.error(e, `[Import] 异常`);
+        logger.error(e, `[Import] 致命异常`);
         return reply.code(500).send({ error: e.message });
     }
 });

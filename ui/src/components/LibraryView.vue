@@ -177,7 +177,7 @@ const deleteSeries = async (id, name) => {
         const res = await fetch(`./api/delete/series?id=${id}`, { method: 'DELETE' });
         const data = await res.json();
         if (data.success) {
-            TshowToast("剧集已删除", "success")
+            showToast("剧集已删除", "success")
             // 移除列表项并关闭详情
             rawData.value = rawData.value.filter(item => item.tmdbId !== id);
             totalItems.value--;
@@ -186,6 +186,8 @@ const deleteSeries = async (id, name) => {
             throw new Error(data.error);
         }
     } catch (e) {
+      console.log(e);
+      
         showToast("删除失败", "error")
     }
 }
