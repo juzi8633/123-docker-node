@@ -42,9 +42,10 @@ const logger = createLogger('App');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// [修改] 增大 bodyLimit 以支持大 JSON 导入
 const app = Fastify({ 
     logger: true, // Fastify 默认日志也开启，用于记录 HTTP 请求详情
-    bodyLimit: 50 * 1024 * 1024
+    bodyLimit: 50 * 1024 * 1024 // 50MB
 });
 
 app.register(fastifyStatic, {
@@ -95,7 +96,7 @@ app.get('/api/health', async (req, reply) => {
 });
 
 // ==========================================
-// [新增] 核心修改：无状态播放接口
+// 核心：无状态播放接口
 // ==========================================
 // URL 格式: /api/play/stream?hash=xxx&size=123&name=video.mp4
 app.get('/api/play/stream', async (req, reply) => {
@@ -110,7 +111,6 @@ app.get('/api/play/stream', async (req, reply) => {
 
     try {
         // 直接调用 core123，不查数据库
-        // 这意味着只要有 hash，哪怕数据库记录删了，也能播放
         const downloadUrl = await core123.getDownloadUrlByHash(
             name, 
             hash, 
@@ -127,10 +127,9 @@ app.get('/api/play/stream', async (req, reply) => {
     }
 });
 
-// [保留] 旧的 ID 播放接口 (为了兼容现有未更新的 strm 文件)
+// [保留] 旧的 ID 播放接口
 app.get('/api/play/:id', async (req, reply) => {
     const { id } = req.params;
-    // 防止 stream 被误识别为 id
     if (id === 'stream') return; 
 
     logger.info({ id }, `[Play] 收到 ID 播放请求`);
@@ -293,6 +292,92 @@ app.post('/api/admin/verify', async (req, reply) => {
     } catch (e) { return reply.code(500).send({ error: e.message }); } finally { isMaintenanceRunning = false; }
 });
 
+// ==========================================
+// [新增] 数据导入接口 (Docker 专用)
+// ==========================================
+app.post('/api/admin/import', async (req, reply) => {
+    const { type } = req.query; // 'series' 或 'episode'
+    const jsonBody = req.body;  
+
+    if (!jsonBody || !type) return reply.code(400).send({ error: "Missing 'type' or JSON body" });
+
+    logger.info(`[Import] 收到导入请求 Type=${type}`);
+
+    // 解析数据结构
+    let dataList = [];
+    if (Array.isArray(jsonBody)) {
+        if (jsonBody[0] && jsonBody[0].results) {
+            for (const item of jsonBody) {
+                if (item.results && Array.isArray(item.results)) {
+                    dataList = dataList.concat(item.results);
+                }
+            }
+        } else {
+            dataList = jsonBody;
+        }
+    } else if (jsonBody.results && Array.isArray(jsonBody.results)) {
+        dataList = jsonBody.results;
+    }
+
+    if (dataList.length === 0) return { success: false, message: "No valid data found" };
+
+    logger.info(`[Import] 解析到 ${dataList.length} 条数据，准备写入...`);
+    let count = 0;
+    const BATCH_SIZE = 1000;
+
+    try {
+        if (type === 'series') {
+            const formatted = dataList.map(item => ({
+                tmdbId: item.tmdb_id,
+                name: item.name,
+                year: item.year || '',
+                type: item.type || 'tv',
+                genres: item.genres || '',
+                originalLanguage: item.originalLanguage || '',
+                originCountry: Array.isArray(item.originCountry) ? item.originCountry.join(',') : (item.originCountry || ''),
+                lastUpdated: new Date()
+            }));
+
+            for (let i = 0; i < formatted.length; i += BATCH_SIZE) {
+                const batch = formatted.slice(i, i + BATCH_SIZE);
+                const res = await prisma.seriesMain.createMany({ data: batch, skipDuplicates: true });
+                count += res.count;
+            }
+
+        } else if (type === 'episode') {
+            const formatted = dataList.map(item => ({
+                tmdbId: item.tmdb_id,
+                season: item.season || 0,
+                episode: item.episode || 0,
+                cleanName: item.clean_name,
+                size: BigInt(item.size || 0),
+                etag: item.etag,
+                score: item.score || 0,
+                type: item.type || 'video',
+                createdAt: item.created_at ? new Date(item.created_at) : new Date()
+            }));
+
+            for (let i = 0; i < formatted.length; i += BATCH_SIZE) {
+                const batch = formatted.slice(i, i + BATCH_SIZE);
+                try {
+                    const res = await prisma.seriesEpisode.createMany({ data: batch, skipDuplicates: true });
+                    count += res.count;
+                } catch (e) {
+                    logger.warn(`批次导入失败: ${e.message}`);
+                }
+            }
+        } else {
+            return reply.code(400).send({ error: "Invalid type" });
+        }
+
+        logger.info(`[Import] ✅ 导入成功，新增 ${count} 条`);
+        return { success: true, count };
+    } catch (e) {
+        logger.error(e, `[Import] 异常`);
+        return reply.code(500).send({ error: e.message });
+    }
+});
+
 app.post('/api/do/', async (req, reply) => {
     const { action, tasks } = req.body; 
     if (action === 'ADD_TASKS') {
@@ -419,10 +504,9 @@ app.delete('/api/delete/series', async (req, reply) => {
     for (const ep of episodes) await strmService.deleteEpisode(ep);
     
     // 2. 删除数据库记录
-    // [修复] 使用 deleteMany 防止 "Record to delete does not exist" 错误
     await prisma.$transaction([
         prisma.seriesEpisode.deleteMany({ where: { tmdbId: id } }),
-        prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) // 变更为 deleteMany
+        prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
     ]);
     return { success: true, id };
 });
