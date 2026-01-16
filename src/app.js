@@ -422,11 +422,16 @@ app.post('/api/submit', async (req, reply) => {
 app.delete('/api/delete/series', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id) return { error: "Missing ID" };
+    
+    // 1. 删除物理文件
     const episodes = await prisma.seriesEpisode.findMany({ where: { tmdbId: id }, include: { series: true } });
     for (const ep of episodes) await strmService.deleteEpisode(ep);
+    
+    // 2. 删除数据库记录
+    // [修复] 使用 deleteMany 防止 "Record to delete does not exist" 错误
     await prisma.$transaction([
         prisma.seriesEpisode.deleteMany({ where: { tmdbId: id } }),
-        prisma.seriesMain.delete({ where: { tmdbId: id } })
+        prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) // 变更为 deleteMany
     ]);
     return { success: true, id };
 });
