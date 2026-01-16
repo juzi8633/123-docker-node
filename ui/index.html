@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>123MetaStore - 智能媒体库</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+      body { background-color: #f1f5f9; -webkit-tap-highlight-color: transparent; }
+      .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+      .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+      .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 4px; }
+      .glass { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+    </style>
+
+    <script>
+    // 全局 Fetch 拦截器 (自动注入 Auth Header)
+    (function() {
+        const originalFetch = window.fetch;
+        window.isLoginShowing = false;
+
+        window.fetch = async function(resource, config = {}) {
+            // 1. 自动注入 Password
+            const pwd = localStorage.getItem('auth_password');
+            if (pwd) {
+                config.headers = { ...config.headers, "Authorization": pwd };
+            }
+
+            // 2. 发起请求
+            const response = await originalFetch(resource, config);
+
+            // 3. 拦截 401 或特定 Header
+            // [优化] 增加 X-Need-Auth 头判断，更灵活
+            const needAuth = response.status === 401 || response.headers.get("X-Need-Auth") === "true";
+
+            if (needAuth) {
+                if (!window.isLoginShowing) {
+                    window.isLoginShowing = true;
+                    Swal.fire({
+                        title: '🔒 系统已锁定',
+                        input: 'password',
+                        inputPlaceholder: '请输入访问密码',
+                        allowOutsideClick: false,
+                        allowEscapeKey: false,
+                        confirmButtonText: '解锁',
+                        confirmButtonColor: '#4f46e5',
+                        backdrop: 'rgba(241, 245, 249, 0.95)',
+                        preConfirm: (pass) => {
+                            if (!pass) Swal.showValidationMessage('密码不能为空');
+                            return pass;
+                        }
+                    }).then((res) => {
+                        if (res.isConfirmed) {
+                            localStorage.setItem('auth_password', res.value);
+                            window.isLoginShowing = false;
+                            window.location.reload();
+                        }
+                    });
+                }
+            }
+            return response;
+        };
+    })();
+    </script>
+  </head>
+  <body class="text-slate-600 antialiased min-h-screen pb-10">
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
