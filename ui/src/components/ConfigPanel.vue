@@ -2,9 +2,11 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { showToast } from '../utils/toast.js'
 import { globalConfig, initConfig } from '../utils/configStore.js'
+import { showConfirm } from '../utils/dialog.js'
 
 const emit = defineEmits(['close'])
 const isSaving = ref(false)
+const isReplacing = ref(false)
 
 const form = ref({
     tmdb_key: '',
@@ -14,15 +16,21 @@ const form = ref({
     worker_accounts: '',
     open123_dir_id: '',
     root_folder_id: '',
-    // [新增] 本地表单增加 189 token
     cloud189_token: '', 
+    host_url: '', // [新增]
     emby_config: {
         host: '',
         api_key: '',
         enabled: false
     },
+    overwrite_strm: false,
+    overwrite_sub: false,
+    skip_sub: false,
     frontend_verify_interval: 3
 })
+
+// [新增] 替换功能专用状态
+const replaceForm = ref({ find: '', replace: '' })
 
 onMounted(() => {
     form.value.tmdb_key = globalConfig.tmdbKey || ''
@@ -32,28 +40,23 @@ onMounted(() => {
     form.value.worker_accounts = globalConfig.workerAccounts || ''
     form.value.open123_dir_id = globalConfig.open123DirId || ''
     form.value.root_folder_id = globalConfig.rootFolderId || ''
-    // [新增] 初始化赋值
     form.value.cloud189_token = globalConfig.cloud189Token || ''
+    form.value.host_url = globalConfig.hostUrl || ''
     
+    form.value.overwrite_strm = globalConfig.overwriteStrm || false
+    form.value.overwrite_sub = globalConfig.overwriteSub || false
+    form.value.skip_sub = globalConfig.skipSub || false
+
     if (globalConfig.embyConfig) {
         form.value.emby_config = { ...globalConfig.embyConfig }
     }
-
-    form.value.frontend_verify_interval = parseInt(localStorage.getItem('frontend_verify_interval') || '3')
-
-    document.body.style.overflow = 'hidden'
-})
-
-onUnmounted(() => {
-    document.body.style.overflow = ''
+    form.value.frontend_verify_interval = parseInt(localStorage.getItem('pending_refresh_interval') || '3')
 })
 
 const handleSave = async () => {
     isSaving.value = true
     try {
-        localStorage.setItem('frontend_verify_interval', form.value.frontend_verify_interval)
-
-        const apiPayload = {
+        const payload = {
             configs: {
                 tmdb_key: form.value.tmdb_key,
                 quark_cookie: form.value.quark_cookie,
@@ -62,179 +65,248 @@ const handleSave = async () => {
                 worker_accounts: form.value.worker_accounts,
                 open123_dir_id: form.value.open123_dir_id,
                 root_folder_id: form.value.root_folder_id,
-                // [新增] 提交 189 token
                 cloud189_token: form.value.cloud189_token,
-                emby_config: JSON.stringify(form.value.emby_config)
+                host_url: form.value.host_url,
+                emby_config: JSON.stringify(form.value.emby_config),
+                overwrite_strm: form.value.overwrite_strm,
+                overwrite_sub: form.value.overwrite_sub,
+                skip_sub: form.value.skip_sub
             }
         }
-
         const res = await fetch('./api/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(apiPayload)
+            body: JSON.stringify(payload)
         })
-        
-        const json = await res.json()
-        if (!json.success) throw new Error(json.message)
-
+        if (!res.ok) throw new Error('保存失败')
         await initConfig()
-
-        showToast("配置已保存并热重载生效", "success")
+        showToast('配置已保存并热重载', 'success')
         emit('close')
-
     } catch (e) {
-        console.error(e)
-        showToast("保存失败: " + e.message, "error")
+        showToast(e.message, 'error')
     } finally {
         isSaving.value = false
+    }
+}
+
+// [新增] 执行物理替换逻辑
+const handleExecuteReplace = async () => {
+    if (!replaceForm.value.find) return showToast('请输入要查找的内容', 'warning')
+    
+    const confirmed = await showConfirm({
+        title: '物理替换确认',
+        htmlContent: `即将扫描所有 .strm 文件，将 <b>${replaceForm.value.find}</b> 替换为 <b>${replaceForm.value.replace || '(空)'}</b>。<br>此操作直接修改磁盘文件且不可撤销！`,
+        type: 'danger',
+        confirmText: '开始替换',
+        cancelText: '取消'
+    })
+    if (!confirmed) return
+
+    isReplacing.value = true
+    try {
+        const res = await fetch('./api/admin/strm-replace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(replaceForm.value)
+        })
+        const data = await res.json()
+        if (data.success) {
+            showToast(`替换完成！扫描:${data.stats.scanned} 替换:${data.stats.replaced}`, 'success', 5000)
+        } else {
+            throw new Error(data.error)
+        }
+    } catch (e) {
+        showToast(e.message, 'error')
+    } finally {
+        isReplacing.value = false
     }
 }
 </script>
 
 <template>
-  <div class="h-full overflow-hidden flex flex-col bg-white">
-      
-    <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between shrink-0 bg-white/80 backdrop-blur z-20">
-        <div>
-            <h2 class="text-lg font-bold text-slate-800 tracking-tight">系统设置</h2>
-            <p class="text-xs text-slate-400 font-medium">配置 API 密钥、账号连接与自动化参数</p>
-        </div>
-        <button @click="$emit('close')" class="w-8 h-8 rounded-full bg-slate-50 text-slate-400 hover:bg-slate-100 hover:text-slate-600 flex items-center justify-center transition-colors shadow-sm ring-1 ring-slate-900/5">
-            <i class="fa-solid fa-times text-sm"></i>
-        </button>
-    </div>
-
-    <div class="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-6">
+  <div class="fixed inset-0 z-[150] flex items-center justify-end">
+    <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" @click="emit('close')"></div>
+    <div class="relative w-full max-w-lg h-full bg-slate-50 shadow-2xl flex flex-col animate-slide-in-right">
         
-        <div class="space-y-3">
-            <div class="flex items-center gap-2 text-indigo-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-film"></i>
-                <h3>元数据刮削 (TMDB)</h3>
+        <div class="px-6 py-5 bg-white border-b border-slate-100 flex items-center justify-between shrink-0">
+            <div>
+                <h3 class="text-lg font-bold text-slate-800">系统配置</h3>
+                <p class="text-xs text-slate-400 mt-0.5">管理核心凭证与同步维护</p>
             </div>
-            <div class="bg-slate-50 p-4 rounded-xl border border-slate-100/60 shadow-sm focus-within:ring-2 focus-within:ring-indigo-500/10 focus-within:border-indigo-200 transition-all">
-                <label class="block text-xs font-bold text-slate-500 mb-1.5">API Read Access Token / API Key</label>
-                <div class="relative">
-                    <i class="fa-solid fa-key absolute left-3 top-1/2 -translate-y-1/2 text-slate-300 text-xs"></i>
-                    <input type="text" v-model="form.tmdb_key" placeholder="输入 TMDB API Key" 
-                        class="w-full pl-8 pr-3 py-2 bg-white border border-slate-200 rounded-lg text-sm text-slate-700 outline-none focus:border-indigo-400 transition-all font-mono placeholder:text-slate-300">
+            <button @click="emit('close')" class="w-9 h-9 flex items-center justify-center rounded-xl hover:bg-slate-100 text-slate-400 transition-colors">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-8">
+            
+            <div class="space-y-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-globe text-indigo-500"></i>
+                    <span class="text-sm font-bold text-slate-700">网络设置 (回源)</span>
+                </div>
+                <div class="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm space-y-3">
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Host URL</label>
+                        <input type="text" v-model="form.host_url" placeholder="http://192.168.1.100:3000" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm font-mono">
+                        <p class="text-[10px] text-slate-400 mt-1 ml-1">该地址决定以后生成的 STRM 文件内容前缀</p>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <div class="space-y-3">
-            <div class="flex items-center gap-2 text-blue-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-cloud"></i>
-                <h3>123 网盘 (核心)</h3>
-            </div>
-            <div class="bg-blue-50/30 p-4 rounded-xl border border-blue-100/60 space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">ClientID (VIP)</label>
-                        <input type="text" v-model="form.vip_id" placeholder="开放平台 ClientID" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400 font-mono">
+            <div class="space-y-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-sliders text-indigo-500"></i>
+                    <span class="text-sm font-bold text-slate-700">同步策略</span>
+                </div>
+                <div class="grid grid-cols-1 gap-3 bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                    <div class="flex items-center justify-between p-1">
+                        <div class="text-xs font-bold text-slate-600">同步时覆盖 STRM</div>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" v-model="form.overwrite_strm" class="sr-only peer">
+                            <div class="w-10 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                        </label>
                     </div>
-                    <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">ClientSecret (VIP)</label>
-                        <input type="password" v-model="form.vip_secret" placeholder="••••••••••••" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400 font-mono">
+                    <div class="flex items-center justify-between p-1">
+                        <div class="text-xs font-bold text-slate-600">更新本地字幕</div>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" v-model="form.overwrite_sub" class="sr-only peer">
+                            <div class="w-10 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between p-1">
+                        <div class="text-xs font-bold text-slate-600">跳过字幕同步</div>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" v-model="form.skip_sub" class="sr-only peer">
+                            <div class="w-10 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-wrench text-amber-500"></i>
+                    <span class="text-sm font-bold text-slate-700">高级维护：存量文件内容替换</span>
+                </div>
+                <div class="bg-amber-50/50 p-4 rounded-2xl border border-amber-100 shadow-sm space-y-4">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-[10px] font-bold text-amber-600 mb-1">查找内容 (旧域名/IP)</label>
+                            <input type="text" v-model="replaceForm.find" placeholder="http://127.0.0.1:3000" class="w-full px-3 py-2 bg-white border border-amber-200 rounded-lg text-xs font-mono outline-none focus:border-amber-400">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-amber-600 mb-1">替换为 (新域名/IP)</label>
+                            <input type="text" v-model="replaceForm.replace" placeholder="https://cdn.com" class="w-full px-3 py-2 bg-white border border-amber-200 rounded-lg text-xs font-mono outline-none focus:border-amber-400">
+                        </div>
+                    </div>
+                    <button @click="handleExecuteReplace" :disabled="isReplacing" class="w-full py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-md shadow-amber-200 transition-all active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2">
+                        <i v-if="isReplacing" class="fa-solid fa-circle-notch fa-spin"></i>
+                        <i v-else class="fa-solid fa-wand-sparkles"></i>
+                        {{ isReplacing ? '正在执行物理替换...' : '立即执行批量替换' }}
+                    </button>
+                    <p class="text-[10px] text-amber-500 text-center">此操作仅修改磁盘文件内容，不会影响数据库记录。</p>
+                </div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-key text-indigo-500"></i>
+                    <span class="text-sm font-bold text-slate-700">基础凭证</span>
+                </div>
+                <div class="space-y-3">
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">TMDB API Key</label>
+                        <input type="password" v-model="form.tmdb_key" placeholder="填写 TMDB 密钥" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md">
+                    </div>
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">189 Cloud Token</label>
+                        <input type="password" v-model="form.cloud189_token" placeholder="天翼云 AccessToken" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md">
+                    </div>
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Quark Cookie</label>
+                        <textarea v-model="form.quark_cookie" rows="3" placeholder="填写夸克网盘 Cookie" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
+                    </div>
+                </div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-server text-indigo-500"></i>
+                    <span class="text-sm font-bold text-slate-700">123网盘 (开放平台)</span>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Client ID</label>
+                        <input v-model="form.vip_id" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
+                    </div>
+                    <div class="group">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Client Secret</label>
+                        <input type="password" v-model="form.vip_secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
                     </div>
                 </div>
                 <div class="space-y-1.5">
-                    <label class="block text-xs font-bold text-slate-500">工兵账号池 (Workers)</label>
-                    <textarea v-model="form.worker_accounts" rows="3" placeholder="ID:Secret,ID:Secret" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-700 outline-none focus:border-blue-400 resize-none font-mono"></textarea>
+                    <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">工兵账号池 (Workers)</label>
+                    <textarea v-model="form.worker_accounts" rows="3" placeholder="ID:Secret,ID:Secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
                 </div>
                  <div class="grid grid-cols-2 gap-4">
                      <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">目标存储目录 ID</label>
-                        <input type="text" v-model="form.open123_dir_id" placeholder="0" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400 font-mono">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">目标存储目录 ID</label>
+                        <input type="text" v-model="form.open123_dir_id" placeholder="0" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
                     </div>
                      <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">后端缓存根目录 ID</label>
-                        <input type="text" v-model="form.root_folder_id" placeholder="0" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400 font-mono">
+                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">后端缓存根目录 ID</label>
+                        <input type="text" v-model="form.root_folder_id" placeholder="0" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
                     </div>
                 </div>
             </div>
-        </div>
 
-        <div class="space-y-3">
-            <div class="flex items-center gap-2 text-orange-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-cloud-sun"></i>
-                <h3>天翼云盘 (189)</h3>
-            </div>
-            <div class="bg-orange-50/30 p-4 rounded-xl border border-orange-100/60 shadow-sm">
-                <label class="block text-xs font-bold text-slate-500 mb-1.5">Access Token</label>
-                <textarea v-model="form.cloud189_token" rows="2" placeholder="输入天翼云盘 AccessToken (用于解析直链)" 
-                    class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-700 outline-none focus:border-orange-400 focus:ring-2 focus:ring-orange-50 transition-all font-mono custom-scrollbar resize-none"></textarea>
-                <p class="text-[10px] text-slate-400 mt-2">
-                    对应 Redis Key: <code class="bg-slate-100 px-1 rounded text-slate-500">auth:189:token</code>。留空则需要后台服务自动刷新。
-                </p>
-            </div>
-        </div>
-
-        <div class="space-y-3">
-            <div class="flex items-center gap-2 text-emerald-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-cookie-bite"></i>
-                <h3>夸克 Cookie</h3>
-            </div>
-            <div class="bg-emerald-50/30 p-4 rounded-xl border border-emerald-100/60 shadow-sm">
-                <label class="block text-xs font-bold text-slate-500 mb-1.5">Cookie</label>
-                <textarea v-model="form.quark_cookie" rows="2" placeholder="输入夸克网页版 Cookie" 
-                    class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-700 outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-50 transition-all font-mono custom-scrollbar resize-none"></textarea>
-            </div>
-        </div>
-
-        <div class="space-y-3">
-            <div class="flex items-center gap-2 text-violet-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-play-circle"></i>
-                <h3>Emby 媒体库通知</h3>
-            </div>
-            <div class="bg-violet-50/30 p-4 rounded-xl border border-violet-100/60 shadow-sm" :class="{'opacity-80': !form.emby_config.enabled}">
-                <div class="flex items-center justify-between pb-3 mb-3 border-b border-violet-100/50">
-                    <label class="text-xs font-bold text-slate-600">启用自动刷新</label>
-                    <label class="relative inline-flex items-center cursor-pointer">
+            <div class="space-y-4">
+                <div class="flex items-center justify-between px-1">
+                    <div class="flex items-center gap-2">
+                        <i class="fa-solid fa-play text-indigo-500"></i>
+                        <span class="text-sm font-bold text-slate-700">Emby 联动</span>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer scale-90">
                         <input type="checkbox" v-model="form.emby_config.enabled" class="sr-only peer">
-                        <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-violet-500"></div>
+                        <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div>
                     </label>
                 </div>
-                <div class="space-y-4" v-if="form.emby_config.enabled || true" :class="{'opacity-50 pointer-events-none filter blur-[1px]': !form.emby_config.enabled}">
-                    <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">Emby Host</label>
-                        <input type="text" v-model="form.emby_config.host" placeholder="http://192.168.1.5:8096" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-violet-400 font-mono">
+                <div class="space-y-3" :class="{'opacity-50 pointer-events-none': !form.emby_config.enabled}">
+                    <input v-model="form.emby_config.host" placeholder="Emby 地址 (http://192.168.1.100:8096)" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm">
+                    <input type="password" v-model="form.emby_config.api_key" placeholder="Emby API Key" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm">
+                </div>
+            </div>
+
+            <div class="space-y-4 pb-4">
+                <div class="flex items-center gap-2 px-1">
+                    <i class="fa-solid fa-gauge-high text-indigo-500"></i>
+                    <span class="text-sm font-bold text-slate-700">交互偏好</span>
+                </div>
+                <div class="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between">
+                    <div>
+                        <div class="text-xs font-bold text-slate-600">刷新间隔 (秒传队列)</div>
+                        <div class="text-[10px] text-slate-400">降低频率可减轻浏览器负担</div>
                     </div>
-                    <div class="space-y-1.5">
-                        <label class="block text-xs font-bold text-slate-500">API Key</label>
-                        <input type="password" v-model="form.emby_config.api_key" placeholder="••••••••••••" class="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-700 outline-none focus:border-violet-400 font-mono">
+                    <div class="flex items-center gap-3">
+                         <input type="range" v-model="form.frontend_verify_interval" min="1" max="10" step="1" 
+                            class="w-24 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 hover:accent-indigo-500">
+                        <span class="text-xs font-mono font-bold text-white bg-indigo-500 px-2 py-0.5 rounded min-w-[3em] text-center shadow-sm">
+                            {{ form.frontend_verify_interval }}s
+                        </span>
                     </div>
                 </div>
             </div>
+
         </div>
 
-        <div class="space-y-3 pb-4">
-             <div class="flex items-center gap-2 text-slate-600 font-bold text-xs uppercase tracking-wider px-1">
-                <i class="fa-solid fa-sliders"></i>
-                <h3>高级设置</h3>
-            </div>
-            <div class="bg-slate-50 p-4 rounded-xl border border-slate-100 flex items-center justify-between shadow-sm">
-                <div>
-                    <label class="block text-xs font-bold text-slate-700">前端轮询间隔</label>
-                    <p class="text-[10px] text-slate-400 mt-0.5">控制任务列表的自动刷新频率</p>
-                </div>
-                <div class="flex items-center gap-3">
-                     <input type="range" v-model="form.frontend_verify_interval" min="1" max="10" step="1" 
-                        class="w-24 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 hover:accent-indigo-500">
-                    <span class="text-xs font-mono font-bold text-white bg-indigo-500 px-2 py-0.5 rounded min-w-[3em] text-center shadow-sm">
-                        {{ form.frontend_verify_interval }}s
-                    </span>
-                </div>
-            </div>
+        <div class="px-6 py-4 bg-white border-t border-slate-100 flex justify-end shrink-0 z-20 shadow-[0_-4px_20px_rgba(0,0,0,0.02)]">
+            <button @click="handleSave" :disabled="isSaving" 
+                class="px-8 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm font-bold rounded-xl shadow-lg shadow-indigo-200 hover:shadow-indigo-300 transition-all active:scale-95 flex items-center gap-2">
+                <i v-if="isSaving" class="fa-solid fa-circle-notch fa-spin"></i>
+                <span v-else>保存配置</span>
+            </button>
         </div>
-
-    </div>
-
-    <div class="px-6 py-4 bg-white border-t border-slate-100 flex justify-end shrink-0 z-20 shadow-[0_-4px_20px_rgba(0,0,0,0.02)]">
-        <button @click="handleSave" :disabled="isSaving" 
-            class="px-8 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-sm font-bold rounded-xl shadow-lg shadow-indigo-200 hover:shadow-indigo-300 transition-all active:scale-95 flex items-center gap-2">
-            <i v-if="isSaving" class="fa-solid fa-circle-notch fa-spin"></i>
-            <span v-else>保存配置</span>
-        </button>
     </div>
   </div>
 </template>
@@ -244,4 +316,13 @@ const handleSave = async () => {
 .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
 .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #94a3b8; }
+
+.animate-slide-in-right {
+    animation: slideInRight 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideInRight {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
 </style>

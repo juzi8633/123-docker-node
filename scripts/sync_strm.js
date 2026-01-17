@@ -2,136 +2,102 @@
 import { prisma } from '../src/db.js';
 import { strmService } from '../src/services/strm.js';
 import { fileURLToPath } from 'url';
-import { createLogger } from '../src/logger.js'; // [优化] 引入日志模块
+import { createLogger } from '../src/logger.js'; 
 
-// [优化] 初始化模块专用日志
 const logger = createLogger('SyncStrm');
-
-// [新增] 延时工具函数
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// 封装为主函数，供 API 调用
-export async function runSyncStrm() {
-    logger.info('🚀 [Start] 开始智能同步 strm 文件 (读写分离模式)...');
+// [修改] 增加 options 参数
+export async function runSyncStrm(options = { 
+    overwriteStrm: false, 
+    overwriteSub: false, 
+    skipSub: false 
+}) {
+    logger.info(`🚀 [Start] 开始同步. 策略: 覆盖STRM=${options.overwriteStrm}, 覆盖字幕=${options.overwriteSub}, 跳过字幕=${options.skipSub}`);
     const startTime = Date.now();
 
     try {
-        // 1. 初始化
-        logger.info('[Init] 正在初始化 StrmService...');
         await strmService.init();
-
-        // 2. 获取总数
         const total = await prisma.seriesEpisode.count();
-        logger.info({ total }, `📊 [Stats] 数据库中共有 ${total} 个媒体文件待处理`);
-
-        if (total === 0) {
-            logger.info('[End] 数据库为空，无需同步');
-            return { success: true, message: "数据库为空" };
-        }
+        if (total === 0) return { success: true, message: "数据库为空" };
 
         const BATCH_SIZE = 500;
         let processed = 0;
-        let lastId = 0; // 游标指针
+        let lastId = 0; 
         let batchCount = 0;
 
-        // 使用 while(true) 配合 break，基于 ID 游标遍历
         while (true) {
             batchCount++;
-            
-            // [优化] Cursor-based Pagination
-            // 必须 include: { series: true }，因为 calculatePath 需要分类信息
             const episodes = await prisma.seriesEpisode.findMany({
                 take: BATCH_SIZE,
-                where: {
-                    id: { gt: lastId }
-                },
+                where: { id: { gt: lastId } },
                 include: { series: true }, 
                 orderBy: { id: 'asc' }
             });
 
-            if (episodes.length === 0) {
-                logger.info(`[Batch ${batchCount}] 未获取到更多数据，循环结束`);
-                break;
-            }
+            if (episodes.length === 0) break;
 
-            // 更新游标 (取当前批次最后一条的 ID)
             lastId = episodes[episodes.length - 1].id;
-            
-            // [核心修改] 队列分离
             const videoQueue = episodes.filter(ep => ep.type !== 'subtitle');
             const subQueue = episodes.filter(ep => ep.type === 'subtitle');
 
             const batchStart = Date.now();
 
-            // 1. 视频处理：极速并发模式 (因为不涉及网络，纯 IO)
+            // 1. 视频处理
             if (videoQueue.length > 0) {
-                // logger.debug(`[Batch] 正在极速生成 ${videoQueue.length} 个视频 STRM...`);
-                await Promise.all(videoQueue.map(ep => strmService.syncVideo(ep)));
+                await Promise.all(videoQueue.map(ep => 
+                    strmService.syncVideo(ep, { overwrite: options.overwriteStrm })
+                ));
             }
 
-            // 2. 字幕处理：龟速串行模式 (防风控，流控)
+            // 2. 字幕处理
             let subSuccess = 0;
-            if (subQueue.length > 0) {
-                logger.info(`[Batch] 发现 ${subQueue.length} 个字幕，进入慢速下载模式 (2秒/个)...`);
+            if (!options.skipSub && subQueue.length > 0) {
                 for (const sub of subQueue) {
-                    const ok = await strmService.syncSubtitle(sub);
-                    if (ok) subSuccess++;
-                    // 无论成功失败，为了防止接口过热，建议都休眠，或者仅成功后休眠
-                    // 这里采用强制休眠 2 秒
-                    await sleep(2000); 
+                    const ok = await strmService.syncSubtitle(sub, { overwrite: options.overwriteSub });
+                    if (ok) {
+                        subSuccess++;
+                        // 如果开启了覆盖模式或者原本不存在，则需要限流
+                        // 简单的逻辑判断：如果是下载成功的，则执行休眠
+                        await sleep(2000); 
+                    }
                 }
             }
 
             const batchDuration = Date.now() - batchStart;
             processed += episodes.length;
             
-            // 打印批次日志
             logger.info({ 
                 batch: batchCount, 
                 videos: videoQueue.length,
-                subs: `${subSuccess}/${subQueue.length}`,
-                durationMs: batchDuration, 
+                subs: options.skipSub ? 'skipped' : `${subSuccess}/${subQueue.length}`,
                 progress: `${processed}/${total}`
             }, `[Progress] 批次完成`);
 
-            // CLI 进度条
             if (process.argv[1] === fileURLToPath(import.meta.url)) {
                 const percent = ((processed / total) * 100).toFixed(1);
-                process.stdout.write(`\r🔄 处理中: ${processed}/${total} (${percent}%) - 上批耗时: ${batchDuration}ms`);
+                process.stdout.write(`\r🔄 处理中: ${processed}/${total} (${percent}%)`);
             }
         }
 
-        // [新增] 循环结束后，统一触发一次 Emby 扫描
         await strmService.triggerScan();
-
-        const totalTime = Date.now() - startTime;
-        const durationSec = (totalTime / 1000).toFixed(2);
-        
-        if (process.argv[1] === fileURLToPath(import.meta.url)) {
-            process.stdout.write('\n');
-        }
-
+        const durationSec = ((Date.now() - startTime) / 1000).toFixed(2);
         logger.info({ durationSec, processed }, `🎉 [Done] 同步完成`);
         
-        return { 
-            success: true, 
-            processed, 
-            total, 
-            duration: durationSec 
-        };
+        return { success: true, processed, total, duration: durationSec };
 
     } catch (e) {
-        if (process.argv[1] === fileURLToPath(import.meta.url)) console.error('\n');
         logger.error(e, `❌ [Error] 同步过程发生异常`);
         throw e;
     }
 }
 
-// 检查是否直接运行 (CLI 模式)
+// CLI 运行时增加环境变量解析支持
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    runSyncStrm()
-        .then(() => process.exit(0))
-        .catch((e) => {
-            process.exit(1);
-        });
+    const config = {
+        overwriteStrm: process.env.OVERWRITE_STRM === 'true',
+        overwriteSub: process.env.OVERWRITE_SUB === 'true',
+        skipSub: process.env.SKIP_SUB === 'true'
+    };
+    runSyncStrm(config).then(() => process.exit(0)).catch(() => process.exit(1));
 }

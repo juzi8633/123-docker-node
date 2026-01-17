@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 import path from 'path'; 
 import { fileURLToPath } from 'url'; 
 import fastifyStatic from '@fastify/static'; 
+import fs from 'fs'; 
 
 // 引入核心模块
 import { addToQueue } from './queue.js';
@@ -11,7 +12,7 @@ import { prisma } from './db.js';
 import redis from './redis.js';
 import { core123 } from './services/core123.js';
 import { strmService } from './services/strm.js'; 
-import { createLogger } from './logger.js'; // [优化] 引入日志模块
+import { createLogger } from './logger.js'; 
 
 // 引入管理脚本逻辑
 import { runSyncStrm } from '../scripts/sync_strm.js';
@@ -44,7 +45,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // [修改] 增大 bodyLimit 以支持大 JSON 导入
 const app = Fastify({ 
-    logger: true, // Fastify 默认日志也开启，用于记录 HTTP 请求详情
+    logger: true, 
     bodyLimit: 50 * 1024 * 1024 // 50MB
 });
 
@@ -75,7 +76,7 @@ app.addHook('onReady', async () => {
         }
 
         await core123.initLinkCacheFolder();
-        await strmService.init();
+        await strmService.init(); 
 
         app.log.info('✅ [System] Redis & SQLite 连接成功');
         logger.info('系统启动完成');
@@ -98,7 +99,6 @@ app.get('/api/health', async (req, reply) => {
 // ==========================================
 // 核心：无状态播放接口
 // ==========================================
-// URL 格式: /api/play/stream?hash=xxx&size=123&name=video.mp4
 app.get('/api/play/stream', async (req, reply) => {
     const { hash, size, name } = req.query;
 
@@ -110,7 +110,6 @@ app.get('/api/play/stream', async (req, reply) => {
     logger.info({ hash, size, name }, `[Play] 收到无状态播放请求: ${name}`);
 
     try {
-        // 直接调用 core123，不查数据库
         const downloadUrl = await core123.getDownloadUrlByHash(
             name, 
             hash, 
@@ -127,7 +126,6 @@ app.get('/api/play/stream', async (req, reply) => {
     }
 });
 
-// [保留] 旧的 ID 播放接口
 app.get('/api/play/:id', async (req, reply) => {
     const { id } = req.params;
     if (id === 'stream') return; 
@@ -225,22 +223,35 @@ app.get('/api/config', async (req, reply) => {
 
 app.post('/api/config', async (req, reply) => {
     logger.info('[Config] 收到配置保存请求');
-    const { configs } = req.body;
-    if (!configs || typeof configs !== 'object') return reply.code(400).send({ success: false, message: "Invalid config object" });
+    const { configs, overwrite_strm, overwrite_sub, skip_sub } = req.body;
+    
+    let finalConfigs = {};
+    if (configs) {
+        finalConfigs = { ...configs };
+    } else {
+        finalConfigs = { ...req.body };
+    }
+    
+    if (req.body.host_url !== undefined) finalConfigs.host_url = req.body.host_url;
+    if (overwrite_strm !== undefined) finalConfigs.overwrite_strm = String(overwrite_strm);
+    if (overwrite_sub !== undefined) finalConfigs.overwrite_sub = String(overwrite_sub);
+    if (skip_sub !== undefined) finalConfigs.skip_sub = String(skip_sub);
 
     try {
-        const operations = Object.entries(configs).map(([key, value]) => {
+        const operations = Object.entries(finalConfigs).map(([key, value]) => {
+            if (key === 'configs') return null;
             return prisma.systemConfig.upsert({
                 where: { key },
-                update: { value: String(value || '') },
-                create: { key, value: String(value || '') }
+                update: { value: String(value === undefined || value === null ? '' : value) },
+                create: { key, value: String(value === undefined || value === null ? '' : value) }
             });
-        });
+        }).filter(Boolean);
+
         await prisma.$transaction(operations);
         logger.info('[Config] 数据库配置更新成功');
 
-        if (configs.hasOwnProperty('cloud189_token')) {
-            const token = configs.cloud189_token;
+        if (finalConfigs.hasOwnProperty('cloud189_token')) {
+            const token = finalConfigs.cloud189_token;
             if (token && token.trim()) {
                 await redis.set('auth:189:token', token.trim());
                 logger.info('[Config] 189 Token 已同步到 Redis');
@@ -254,11 +265,197 @@ app.post('/api/config', async (req, reply) => {
             await core123.reloadConfig();
             logger.info('[Config] Core123 服务已热重载');
         }
+        
+        if (strmService.reloadConfig) {
+            await strmService.reloadConfig();
+        }
+
         metaCache.clear();
         return { success: true };
     } catch (e) {
         logger.error(e, `[Config] ❌ 保存失败`);
         return reply.code(500).send({ success: false, message: e.message });
+    }
+});
+
+// ==========================================
+// [新增] Emby Webhook 接口 (删除同步)
+// ==========================================
+app.post('/api/webhook/emby', async (req, reply) => {
+    const { secret } = req.query;
+    const payload = req.body;
+
+    // 1. 安全校验
+    if (secret !== CALLBACK_SECRET) {
+        logger.warn({ ip: req.ip }, '[Webhook] ❌ Emby 回调密钥错误，拒绝访问');
+        return reply.code(403).send('Forbidden: Invalid Secret');
+    }
+
+    // 2. 详细日志记录 (用于调试数据格式)
+    if (!payload || !payload.Event) {
+        logger.warn('[Webhook] 收到空 Payload 或缺失 Event 字段');
+        return { status: 'ignored', reason: 'invalid_payload' };
+    }
+
+    logger.info({ event: payload.Event, itemType: payload.Item?.Type, itemName: payload.Item?.Name }, `[Webhook] 收到 Emby 事件通知`);
+    
+    // 仅开发环境打印完整 Payload 以免日志爆炸，或者你可以强制开启
+    logger.debug({ payload }, '[Webhook] Full Payload');
+
+    // 3. 仅处理删除事件
+    if (payload.Event !== 'item.deleted') {
+        return { status: 'ignored', reason: `event_${payload.Event}_not_handled` };
+    }
+
+    const item = payload.Item;
+    if (!item) return { status: 'ignored', reason: 'no_item_data' };
+
+    // 4. 解析关键信息
+    // Emby 的 Item.Type 可能是: Series, Season, Episode, Movie
+    const type = item.Type;
+    // 获取 TMDB ID (ProviderIds.Tmdb)
+    const tmdbIdStr = item.ProviderIds?.Tmdb; 
+    // 注意：对于 Episode，Emby 可能会返回 Show 的 ID 或 Episode 的 ID，这取决于元数据。
+    // 但我们的数据库 SeriesEpisode 表关联的是 Show 的 TMDB ID (SeriesMain.tmdbId)。
+    
+    if (!tmdbIdStr) {
+        logger.warn({ itemName: item.Name }, '[Webhook] ⚠️ 无法获取 TMDB ID，跳过处理');
+        return { status: 'skipped', reason: 'missing_tmdb_id' };
+    }
+    const tmdbId = parseInt(tmdbIdStr);
+
+    try {
+        let deletedCount = 0;
+
+        // --- 情况 A: 删除整部剧 (Series) 或 电影 (Movie) ---
+        if (type === 'Series' || type === 'Movie') {
+            logger.info({ tmdbId, type }, `[Webhook] 正在删除整部作品...`);
+            
+            // 查出该剧/电影下的所有分集
+            const episodes = await prisma.seriesEpisode.findMany({
+                where: { tmdbId },
+                include: { series: true } // 必须包含 series 才能计算路径
+            });
+
+            // 1. 删除物理文件
+            for (const ep of episodes) {
+                await strmService.deleteEpisode(ep);
+            }
+
+            // 2. 删除数据库记录 (删除 SeriesMain 会级联删除 SeriesEpisode)
+            const delRes = await prisma.seriesMain.deleteMany({ where: { tmdbId } });
+            deletedCount = delRes.count;
+            
+            logger.info({ title: item.Name, count: deletedCount }, `[Webhook] ✅ 整部作品已彻底清理`);
+        } 
+        
+        // --- 情况 B: 删除单集 (Episode) ---
+        else if (type === 'Episode') {
+            const seasonNum = item.ParentIndexNumber; // 季号
+            const episodeNum = item.IndexNumber; // 集号
+
+            if (seasonNum === undefined || episodeNum === undefined) {
+                logger.warn('[Webhook] 单集缺失 S/E 信息，无法定位');
+                return { status: 'failed', reason: 'missing_index' };
+            }
+
+            logger.info({ tmdbId, S: seasonNum, E: episodeNum }, `[Webhook] 正在删除单集...`);
+
+            // 查找对应的单集记录
+            // 注意：这里假设 Webhook 里的 Tmdb ID 是 Series 的 ID。
+            // 如果 Emby 传的是单集自身的 TMDB ID，这里可能会查不到。
+            // 但考虑到 Emby 的行为，通常在删除 Episode 时上下文会有 Series ID。
+            // 兜底逻辑：如果数据库查不到，说明 ID 不匹配或已删除。
+            const ep = await prisma.seriesEpisode.findFirst({
+                where: { 
+                    tmdbId: tmdbId, 
+                    season: seasonNum, 
+                    episode: episodeNum,
+                    type: { not: 'subtitle' } // 优先删视频
+                },
+                include: { series: true }
+            });
+
+            if (ep) {
+                // 1. 物理删除
+                await strmService.deleteEpisode(ep);
+                // 2. 数据库删除
+                await prisma.seriesEpisode.delete({ where: { id: ep.id } });
+                deletedCount = 1;
+                logger.info({ file: ep.cleanName }, `[Webhook] ✅ 单集已删除`);
+            } else {
+                logger.warn(`[Webhook] 数据库未找到对应单集 (Tmdb:${tmdbId} S${seasonNum}E${episodeNum})`);
+            }
+        }
+
+        // --- 情况 C: 删除整季 (Season) ---
+        else if (type === 'Season') {
+            const seasonNum = item.IndexNumber; // 季号本身
+            if (seasonNum === undefined) return { status: 'failed', reason: 'missing_season_index' };
+
+            logger.info({ tmdbId, Season: seasonNum }, `[Webhook] 正在删除整季...`);
+
+            const seasonEps = await prisma.seriesEpisode.findMany({
+                where: { tmdbId, season: seasonNum },
+                include: { series: true }
+            });
+
+            for (const ep of seasonEps) {
+                await strmService.deleteEpisode(ep);
+                await prisma.seriesEpisode.delete({ where: { id: ep.id } });
+                deletedCount++;
+            }
+            logger.info({ count: deletedCount }, `[Webhook] ✅ 整季已清理`);
+        }
+
+        return { success: true, deletedCount };
+
+    } catch (e) {
+        logger.error(e, `[Webhook] 处理删除事件失败`);
+        return reply.code(500).send({ error: e.message });
+    }
+});
+
+app.post('/api/admin/strm-replace', async (req, reply) => {
+    const { find, replace } = req.body;
+    if (!find) return reply.code(400).send({ error: "查找内容不能为空" });
+
+    logger.info({ find, replace }, '[Maintenance] 开始全量替换 STRM 内容...');
+    const STRM_ROOT = process.env.STRM_ROOT || path.join(process.cwd(), 'strm');
+    
+    let scanned = 0;
+    let replaced = 0;
+
+    async function walkAndReplace(dir) {
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                await walkAndReplace(fullPath);
+            } else if (entry.name.endsWith('.strm')) {
+                scanned++;
+                try {
+                    const content = await fs.promises.readFile(fullPath, 'utf8');
+                    if (content.includes(find)) {
+                        const newContent = content.split(find).join(replace || '');
+                        await fs.promises.writeFile(fullPath, newContent, 'utf8');
+                        replaced++;
+                    }
+                } catch (readErr) {
+                    logger.warn({ file: entry.name, msg: readErr.message }, '[Maintenance] 文件读写失败');
+                }
+            }
+        }
+    }
+
+    try {
+        await walkAndReplace(STRM_ROOT);
+        logger.info({ scanned, replaced }, '[Maintenance] STRM 内容替换完成');
+        strmService.triggerScan().catch(() => {});
+        return { success: true, stats: { scanned, replaced } };
+    } catch (e) {
+        logger.error(e, '[Maintenance] 替换过程出错');
+        return reply.code(500).send({ error: e.message });
     }
 });
 
@@ -277,8 +474,11 @@ app.get('/api/offline/progress', async (req, reply) => {
 app.post('/api/admin/sync', async (req, reply) => {
     if (isMaintenanceRunning) return reply.code(409).send({ error: "Another task is already running" });
     isMaintenanceRunning = true;
+    
+    const { overwriteStrm, overwriteSub, skipSub } = req.body;
+    
     try {
-        const result = await runSyncStrm();
+        const result = await runSyncStrm({ overwriteStrm, overwriteSub, skipSub });
         return { status: 'ok', data: result };
     } catch (e) { return reply.code(500).send({ error: e.message }); } finally { isMaintenanceRunning = false; }
 });
@@ -292,13 +492,9 @@ app.post('/api/admin/verify', async (req, reply) => {
     } catch (e) { return reply.code(500).send({ error: e.message }); } finally { isMaintenanceRunning = false; }
 });
 
-// ==========================================
-// [新增] 数据库清空接口 (SeriesMain & SeriesEpisode)
-// ==========================================
 app.post('/api/admin/clear-db', async (req, reply) => {
     logger.warn('[Admin] ⚠️ 收到清空媒体库请求 (Clear DB)...');
     try {
-        // 使用事务确保同时清空，避免中间状态
         const [epCount, mainCount] = await prisma.$transaction([
             prisma.seriesEpisode.deleteMany(),
             prisma.seriesMain.deleteMany()
@@ -306,7 +502,6 @@ app.post('/api/admin/clear-db', async (req, reply) => {
         
         logger.info({ epCount: epCount.count, mainCount: mainCount.count }, '[Admin] ✅ 数据库媒体表已清空');
         
-        // 清理内存中的元数据缓存
         metaCache.clear();
 
         return { 
@@ -323,18 +518,14 @@ app.post('/api/admin/clear-db', async (req, reply) => {
     }
 });
 
-// ==========================================
-// [新增] 数据导入接口 (Docker 专用) - 性能增强版
-// ==========================================
 app.post('/api/admin/import', async (req, reply) => {
-    const { type } = req.query; // 'series' 或 'episode'
+    const { type } = req.query; 
     const jsonBody = req.body;  
 
     if (!jsonBody || !type) return reply.code(400).send({ error: "Missing 'type' or JSON body" });
 
     logger.info(`[Import] 收到导入请求 Type=${type}`);
 
-    // 解析数据结构
     let dataList = [];
     if (Array.isArray(jsonBody)) {
         if (jsonBody[0] && jsonBody[0].results) {
@@ -357,11 +548,9 @@ app.post('/api/admin/import', async (req, reply) => {
 
     try {
         if (type === 'series') {
-            // 1. 过滤无效数据
             const validData = dataList.filter(item => item.tmdb_id && !isNaN(parseInt(item.tmdb_id)));
-            logger.info(`[Import] 有效剧集数据: ${validData.length} 条 (原始: ${dataList.length})`);
+            logger.info(`[Import] 有效剧集数据: ${validData.length} 条`);
 
-            // 改用 upsert 逐条插入，避免 createMany 遇到重复报错
             for (const item of validData) {
                 try {
                     await prisma.seriesMain.upsert({
@@ -393,12 +582,10 @@ app.post('/api/admin/import', async (req, reply) => {
             }
 
         } else if (type === 'episode') {
-            // 2. 过滤无效单集
             const validData = dataList.filter(item => item.tmdb_id && item.clean_name && (item.size !== undefined && item.size !== null));
-            logger.info(`[Import] 有效单集数据: ${validData.length} 条 (原始: ${dataList.length})`);
+            logger.info(`[Import] 有效单集数据: ${validData.length} 条`);
 
-            // [核心优化] 批量插入 (Batch Insert)
-            const BATCH_SIZE = 500; // 每批 500 条
+            const BATCH_SIZE = 500; 
             
             for (let i = 0; i < validData.length; i += BATCH_SIZE) {
                 const batch = validData.slice(i, i + BATCH_SIZE);
@@ -420,7 +607,6 @@ app.post('/api/admin/import', async (req, reply) => {
                                 }
                             });
                         } catch (e) {
-                            // 忽略唯一性约束错误(重复数据)，其他错误记录日志
                             if (!e.message.includes('Unique constraint')) {
                                 logger.warn(`[Import] 单集写入失败 (${item.clean_name}): ${e.message}`);
                             }
@@ -430,7 +616,6 @@ app.post('/api/admin/import', async (req, reply) => {
                 
                 count += batch.length;
                 
-                // 进度日志：每 5000 条打印一次，或最后一批
                 if ((i + BATCH_SIZE) % 5000 === 0 || (i + BATCH_SIZE) >= validData.length) {
                     logger.info(`[Import] 🚀 进度: ${Math.min(i + BATCH_SIZE, validData.length)} / ${validData.length}`);
                 }
@@ -569,11 +754,9 @@ app.delete('/api/delete/series', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id) return { error: "Missing ID" };
     
-    // 1. 删除物理文件
     const episodes = await prisma.seriesEpisode.findMany({ where: { tmdbId: id }, include: { series: true } });
     for (const ep of episodes) await strmService.deleteEpisode(ep);
     
-    // 2. 删除数据库记录
     await prisma.$transaction([
         prisma.seriesEpisode.deleteMany({ where: { tmdbId: id } }),
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
@@ -693,6 +876,10 @@ app.post('/api/callback/123', async (req, reply) => {
     await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
     return { code: 0 };
 });
+
+// Emby 官方 Webhook 是 'application/x-www-form-urlencoded' 还是 'application/json' ?
+// 默认 Emby Webhook 插件发送的是 JSON。如果有问题，需要检查 Content-Type。
+app.addContentTypeParser('application/json', { parseAs: 'string' }, app.getDefaultJsonParser);
 
 setInterval(() => {
     core123.recycleAllCacheFolders().catch(err => { logger.error(err, '❌ [Schedule] Daily cleanup failed'); });

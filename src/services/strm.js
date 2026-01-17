@@ -12,8 +12,6 @@ dotenv.config();
 const logger = createLogger('StrmService');
 
 const STRM_ROOT = process.env.STRM_ROOT || path.join(process.cwd(), 'strm');
-// [提示] HOST_URL 必须是 Emby 可访问的 IP，Docker 环境下慎用 127.0.0.1
-const HOST_URL = process.env.HOST_URL || 'http://127.0.0.1:3000';
 
 // === Emby 通知与防抖逻辑变量 ===
 let embyDebounceTimer = null;
@@ -57,9 +55,16 @@ async function scheduleEmbyScan() {
 }
 
 class StrmService {
+    constructor() {
+        // [修改] 默认值设为环境变量，后续通过 reloadConfig 覆盖
+        this.hostUrl = process.env.HOST_URL || 'http://127.0.0.1:3000';
+    }
+
     async init() {
         try {
             await fs.mkdir(STRM_ROOT, { recursive: true });
+            // [新增] 初始化时加载数据库中的 Host 配置
+            await this.reloadConfig();
             logger.info(`[Init] STRM 根目录就绪: ${STRM_ROOT}`);
         } catch (e) {
             logger.error(e, '[Init] Failed to create STRM root');
@@ -67,11 +72,41 @@ class StrmService {
         }
     }
 
+    // [新增] 热重载配置方法
+    async reloadConfig() {
+        try {
+            const config = await prisma.systemConfig.findUnique({ where: { key: 'host_url' } });
+            if (config && config.value) {
+                // 去除末尾斜杠
+                this.hostUrl = config.value.replace(/\/$/, '');
+                logger.info(`[Config] StrmService HostURL 更新为: ${this.hostUrl}`);
+            }
+        } catch (e) {
+            logger.warn('[Config] 无法从数据库加载 host_url，保持当前值');
+        }
+    }
+
     // [拆分逻辑] 1. 视频同步专用 (无网络请求，极速)
-    async syncVideo(ep) {
+    // [修改] 增加 options 支持 overwrite
+    async syncVideo(ep, options = { overwrite: false }) {
         try {
             const { fullDir, fullPath, playUrl } = this.prepareSyncData(ep);
             if (!playUrl) return; // 防御性编程
+
+            // 检查文件是否存在
+            const exists = await fs.access(fullPath).then(() => true).catch(() => false);
+            if (exists) {
+                const currentContent = await fs.readFile(fullPath, 'utf8');
+                // 如果内容完全一致，且不强制覆盖，则跳过
+                if (currentContent === playUrl && !options.overwrite) return;
+                
+                // 如果内容不一致（例如域名变了），即便不强制覆盖也需要更新
+                if (currentContent !== playUrl) {
+                    logger.info({ file: ep.cleanName }, `[Video] 检测到内容变更(域名或参数)，正在更新...`);
+                } else if (options.overwrite) {
+                    // logger.debug({ file: ep.cleanName }, `[Video] 强制覆盖模式启用`);
+                }
+            }
 
             await fs.mkdir(fullDir, { recursive: true });
             await fs.writeFile(fullPath, playUrl, 'utf8');
@@ -83,10 +118,18 @@ class StrmService {
     }
 
     // [拆分逻辑] 2. 字幕同步专用 (有网络请求，需外部流控)
-    async syncSubtitle(ep) {
+    // [修改] 增加 options 支持 overwrite
+    async syncSubtitle(ep, options = { overwrite: false }) {
         try {
             const { fullDir, fullPath, isSubtitle } = this.prepareSyncData(ep);
             if (!isSubtitle) return;
+
+            const exists = await fs.access(fullPath).then(() => true).catch(() => false);
+            
+            // 如果存在且不覆盖，直接返回成功 (跳过下载)
+            if (exists && !options.overwrite) {
+                return true;
+            }
 
             await fs.mkdir(fullDir, { recursive: true });
 
@@ -139,9 +182,9 @@ class StrmService {
 
         try {
             if (ep.type === 'subtitle') {
-                await this.syncSubtitle(ep);
+                await this.syncSubtitle(ep, { overwrite: true });
             } else {
-                await this.syncVideo(ep);
+                await this.syncVideo(ep, { overwrite: true });
             }
             await scheduleEmbyScan();
         } catch (e) {
@@ -158,7 +201,8 @@ class StrmService {
         let playUrl = null;
         if (!isSubtitle) {
             const encodedName = encodeURIComponent(ep.cleanName);
-            playUrl = `${HOST_URL}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}`;
+            // [核心修改] 使用 this.hostUrl 动态获取当前配置的域名
+            playUrl = `${this.hostUrl}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}`;
         }
         return { fullDir, fullPath, isSubtitle, playUrl };
     }
