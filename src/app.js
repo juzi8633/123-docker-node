@@ -285,13 +285,11 @@ app.post('/api/webhook/emby', async (req, reply) => {
     const { secret } = req.query;
     const payload = req.body;
 
-    // 1. 安全校验
     if (secret !== CALLBACK_SECRET) {
         logger.warn({ ip: req.ip }, '[Webhook] ❌ Emby 回调密钥错误，拒绝访问');
         return reply.code(403).send('Forbidden: Invalid Secret');
     }
 
-    // 2. 详细日志记录 (用于调试数据格式)
     if (!payload || !payload.Event) {
         logger.warn('[Webhook] 收到空 Payload 或缺失 Event 字段');
         return { status: 'ignored', reason: 'invalid_payload' };
@@ -299,10 +297,8 @@ app.post('/api/webhook/emby', async (req, reply) => {
 
     logger.info({ event: payload.Event, itemType: payload.Item?.Type, itemName: payload.Item?.Name }, `[Webhook] 收到 Emby 事件通知`);
     
-    // 仅开发环境打印完整 Payload 以免日志爆炸，或者你可以强制开启
-    logger.debug({ payload }, '[Webhook] Full Payload');
+    // logger.debug({ payload }, '[Webhook] Full Payload');
 
-    // 3. 仅处理删除事件
     if (payload.Event !== 'item.deleted') {
         return { status: 'ignored', reason: `event_${payload.Event}_not_handled` };
     }
@@ -310,13 +306,8 @@ app.post('/api/webhook/emby', async (req, reply) => {
     const item = payload.Item;
     if (!item) return { status: 'ignored', reason: 'no_item_data' };
 
-    // 4. 解析关键信息
-    // Emby 的 Item.Type 可能是: Series, Season, Episode, Movie
     const type = item.Type;
-    // 获取 TMDB ID (ProviderIds.Tmdb)
     const tmdbIdStr = item.ProviderIds?.Tmdb; 
-    // 注意：对于 Episode，Emby 可能会返回 Show 的 ID 或 Episode 的 ID，这取决于元数据。
-    // 但我们的数据库 SeriesEpisode 表关联的是 Show 的 TMDB ID (SeriesMain.tmdbId)。
     
     if (!tmdbIdStr) {
         logger.warn({ itemName: item.Name }, '[Webhook] ⚠️ 无法获取 TMDB ID，跳过处理');
@@ -331,18 +322,15 @@ app.post('/api/webhook/emby', async (req, reply) => {
         if (type === 'Series' || type === 'Movie') {
             logger.info({ tmdbId, type }, `[Webhook] 正在删除整部作品...`);
             
-            // 查出该剧/电影下的所有分集
             const episodes = await prisma.seriesEpisode.findMany({
                 where: { tmdbId },
-                include: { series: true } // 必须包含 series 才能计算路径
+                include: { series: true } 
             });
 
-            // 1. 删除物理文件
             for (const ep of episodes) {
                 await strmService.deleteEpisode(ep);
             }
 
-            // 2. 删除数据库记录 (删除 SeriesMain 会级联删除 SeriesEpisode)
             const delRes = await prisma.seriesMain.deleteMany({ where: { tmdbId } });
             deletedCount = delRes.count;
             
@@ -351,8 +339,8 @@ app.post('/api/webhook/emby', async (req, reply) => {
         
         // --- 情况 B: 删除单集 (Episode) ---
         else if (type === 'Episode') {
-            const seasonNum = item.ParentIndexNumber; // 季号
-            const episodeNum = item.IndexNumber; // 集号
+            const seasonNum = item.ParentIndexNumber; 
+            const episodeNum = item.IndexNumber; 
 
             if (seasonNum === undefined || episodeNum === undefined) {
                 logger.warn('[Webhook] 单集缺失 S/E 信息，无法定位');
@@ -361,25 +349,18 @@ app.post('/api/webhook/emby', async (req, reply) => {
 
             logger.info({ tmdbId, S: seasonNum, E: episodeNum }, `[Webhook] 正在删除单集...`);
 
-            // 查找对应的单集记录
-            // 注意：这里假设 Webhook 里的 Tmdb ID 是 Series 的 ID。
-            // 如果 Emby 传的是单集自身的 TMDB ID，这里可能会查不到。
-            // 但考虑到 Emby 的行为，通常在删除 Episode 时上下文会有 Series ID。
-            // 兜底逻辑：如果数据库查不到，说明 ID 不匹配或已删除。
             const ep = await prisma.seriesEpisode.findFirst({
                 where: { 
                     tmdbId: tmdbId, 
                     season: seasonNum, 
                     episode: episodeNum,
-                    type: { not: 'subtitle' } // 优先删视频
+                    type: { not: 'subtitle' } 
                 },
                 include: { series: true }
             });
 
             if (ep) {
-                // 1. 物理删除
                 await strmService.deleteEpisode(ep);
-                // 2. 数据库删除
                 await prisma.seriesEpisode.delete({ where: { id: ep.id } });
                 deletedCount = 1;
                 logger.info({ file: ep.cleanName }, `[Webhook] ✅ 单集已删除`);
@@ -390,7 +371,7 @@ app.post('/api/webhook/emby', async (req, reply) => {
 
         // --- 情况 C: 删除整季 (Season) ---
         else if (type === 'Season') {
-            const seasonNum = item.IndexNumber; // 季号本身
+            const seasonNum = item.IndexNumber; 
             if (seasonNum === undefined) return { status: 'failed', reason: 'missing_season_index' };
 
             logger.info({ tmdbId, Season: seasonNum }, `[Webhook] 正在删除整季...`);
@@ -434,6 +415,11 @@ app.post('/api/admin/strm-replace', async (req, reply) => {
                 await walkAndReplace(fullPath);
             } else if (entry.name.endsWith('.strm')) {
                 scanned++;
+                // [核心修复] 每 500 个文件打印一次进度，解决控制台无反馈的问题
+                if (scanned % 500 === 0) {
+                    logger.info({ scanned, replaced }, `[Maintenance] 🔄 正在扫描进度...`);
+                }
+
                 try {
                     const content = await fs.promises.readFile(fullPath, 'utf8');
                     if (content.includes(find)) {
@@ -754,9 +740,11 @@ app.delete('/api/delete/series', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id) return { error: "Missing ID" };
     
+    // 1. 删除物理文件
     const episodes = await prisma.seriesEpisode.findMany({ where: { tmdbId: id }, include: { series: true } });
     for (const ep of episodes) await strmService.deleteEpisode(ep);
     
+    // 2. 删除数据库记录
     await prisma.$transaction([
         prisma.seriesEpisode.deleteMany({ where: { tmdbId: id } }),
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
@@ -876,10 +864,6 @@ app.post('/api/callback/123', async (req, reply) => {
     await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
     return { code: 0 };
 });
-
-// Emby 官方 Webhook 是 'application/x-www-form-urlencoded' 还是 'application/json' ?
-// 默认 Emby Webhook 插件发送的是 JSON。如果有问题，需要检查 Content-Type。
-app.addContentTypeParser('application/json', { parseAs: 'string' }, app.getDefaultJsonParser);
 
 setInterval(() => {
     core123.recycleAllCacheFolders().catch(err => { logger.error(err, '❌ [Schedule] Daily cleanup failed'); });
