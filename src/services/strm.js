@@ -1,6 +1,7 @@
 // src/services/strm.js
 import fs from 'fs/promises';
 import path from 'path';
+import crypto from 'node:crypto'; // [新增] 引入 crypto 模块
 import { prisma } from '../db.js';
 import { core123 } from './core123.js'; 
 import dotenv from 'dotenv';
@@ -54,6 +55,11 @@ async function scheduleEmbyScan() {
     }, EMBY_DEBOUNCE_MS);
 }
 
+// [新增] 辅助函数：计算内容哈希
+function calculateHash(content) {
+    return crypto.createHash('md5').update(content).digest('hex');
+}
+
 class StrmService {
     constructor() {
         // [修改] 默认值设为环境变量，后续通过 reloadConfig 覆盖
@@ -87,30 +93,37 @@ class StrmService {
     }
 
     // [拆分逻辑] 1. 视频同步专用 (无网络请求，极速)
-    // [修改] 增加 options 支持 overwrite
+    // [优化] 引入 Hash 校验，实现零 I/O 同步
     async syncVideo(ep, options = { overwrite: false }) {
         try {
             const { fullDir, fullPath, playUrl } = this.prepareSyncData(ep);
             if (!playUrl) return; // 防御性编程
 
-            // 检查文件是否存在
-            const exists = await fs.access(fullPath).then(() => true).catch(() => false);
-            if (exists) {
-                const currentContent = await fs.readFile(fullPath, 'utf8');
-                // 如果内容完全一致，且不强制覆盖，则跳过
-                if (currentContent === playUrl && !options.overwrite) return;
-                
-                // 如果内容不一致（例如域名变了），即便不强制覆盖也需要更新
-                if (currentContent !== playUrl) {
-                    logger.info({ file: ep.cleanName }, `[Video] 检测到内容变更(域名或参数)，正在更新...`);
-                } else if (options.overwrite) {
-                    // logger.debug({ file: ep.cleanName }, `[Video] 强制覆盖模式启用`);
-                }
+            // 1. 计算新内容的指纹 (Hash)
+            const newHash = calculateHash(playUrl);
+
+            // 2. [SSD 优化核心] 检查数据库中的 Hash 是否一致
+            // 如果 Hash 一致，且不强制覆盖，则完全跳过文件系统操作
+            // 注意：需要确保 prisma schema 中已添加 strmHash 字段
+            if (ep.strmHash === newHash && !options.overwrite) {
+                // logger.debug({ id: ep.id }, '[Video] Hash 匹配，跳过 I/O');
+                return;
             }
 
+            // 3. 执行文件写入 (仅当内容变更或强制覆盖时)
             await fs.mkdir(fullDir, { recursive: true });
             await fs.writeFile(fullPath, playUrl, 'utf8');
-            // logger.debug({ file: path.basename(fullPath) }, `[Video] ✅ STRM 生成完毕`);
+
+            // 4. 更新数据库指纹
+            // 这样下次同步时就能命中上面的 Hash 检查
+            await prisma.seriesEpisode.update({
+                where: { id: ep.id },
+                data: { strmHash: newHash }
+            });
+
+            // 仅在实际写入时记录日志
+            logger.info({ file: ep.cleanName, reason: ep.strmHash ? 'hash_mismatch' : 'new_entry' }, `[Video] 🔄 STRM 已更新/生成`);
+
         } catch (e) {
             logger.error(e, `[Video] ❌ 生成失败 ID:${ep.id}`);
             throw e; // 抛出异常供调用方统计
@@ -201,8 +214,17 @@ class StrmService {
         let playUrl = null;
         if (!isSubtitle) {
             const encodedName = encodeURIComponent(ep.cleanName);
+            
+            // [新增] 安全签名生成
+            // 使用环境变量 SECURITY_KEY，如果没有则回退到 CALLBACK_SECRET，再没有则使用默认值
+            const secret = process.env.SECURITY_KEY || process.env.CALLBACK_SECRET || 'default_secret_key';
+            const signStr = `${ep.etag}|${ep.size}`;
+            // HMAC-SHA256 签名
+            const sign = crypto.createHmac('sha256', secret).update(signStr).digest('hex');
+
+            // [修改] URL 拼接，追加 &sign 参数
             // [核心修改] 使用 this.hostUrl 动态获取当前配置的域名
-            playUrl = `${this.hostUrl}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}`;
+            playUrl = `${this.hostUrl}/api/play/stream?hash=${ep.etag}&size=${ep.size}&name=${encodedName}&sign=${sign}`;
         }
         return { fullDir, fullPath, isSubtitle, playUrl };
     }

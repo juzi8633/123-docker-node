@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url'; 
 import fastifyStatic from '@fastify/static'; 
 import fs from 'fs'; 
+import crypto from 'node:crypto'; // [新增] 引入 crypto 用于签名校验
 
 // 引入核心模块
 import { addToQueue } from './queue.js';
@@ -100,12 +101,26 @@ app.get('/api/health', async (req, reply) => {
 // 核心：无状态播放接口
 // ==========================================
 app.get('/api/play/stream', async (req, reply) => {
-    const { hash, size, name } = req.query;
+    const { hash, size, name, sign } = req.query; // [修改] 获取 sign 参数
 
     if (!hash || !size || !name) {
         logger.warn(`[Play] ❌ 参数缺失: Hash/Size/Name 必须提供`);
         return reply.code(400).send("Missing hash, size or name params");
     }
+
+    // =========================================================
+    // [新增] 安全校验逻辑：HMAC 签名验证
+    // =========================================================
+    const secret = process.env.SECURITY_KEY || process.env.CALLBACK_SECRET || 'default_secret_key';
+    const signStr = `${hash}|${size}`;
+    const expectedSign = crypto.createHmac('sha256', secret).update(signStr).digest('hex');
+
+    // 校验签名是否匹配 (防止篡改或盗链)
+    if (!sign || sign !== expectedSign) {
+        logger.warn({ ip: req.ip, name, querySign: sign }, `[Security] ⛔ 签名校验失败，拒绝非法播放请求`);
+        return reply.code(403).send("Forbidden: Invalid Signature");
+    }
+    // =========================================================
 
     logger.info({ hash, size, name }, `[Play] 收到无状态播放请求: ${name}`);
 

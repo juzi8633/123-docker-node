@@ -1,3 +1,5 @@
+// schema.prisma
+
 generator client {
   provider = "prisma-client-js"
   binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
@@ -15,8 +17,7 @@ model SeriesMain {
   name            String
   year            String?
   type            String   // 'movie' or 'tv'
-  genres          String?
-  // 逗号分隔的 Genre ID，如 "16,18,35"
+  genres          String?  // 逗号分隔的 Genre ID，如 "16,18,35"
   
   // [新增] 原声语言 (如 'zh', 'en', 'ja') - 对应 YAML 中的 original_language
   originalLanguage String? @map("original_language") 
@@ -30,7 +31,7 @@ model SeriesMain {
   @@map("series_main")
 }
 
-// 剧集分集/文件表 (保持不变)
+// 剧集分集/文件表
 model SeriesEpisode {
   id          Int      @id @default(autoincrement())
   tmdbId      Int      @map("tmdb_id")
@@ -42,6 +43,11 @@ model SeriesEpisode {
   score       Int      @default(0)
   type        String   // 'video' or 'subtitle'
   createdAt   DateTime @default(now()) @map("created_at")
+  
+  // [本次新增核心字段] 
+  // 存储生成的 strm 内容的哈希值 (MD5)
+  // 用于比对配置或域名是否变更，变更时才重写文件，实现零 I/O 同步
+  strmHash    String?  @map("strm_hash")
 
   series      SeriesMain @relation(fields: [tmdbId], references: [tmdbId], onDelete: Cascade)
 
