@@ -2,7 +2,6 @@
 import { ref, shallowRef, shallowReactive, computed, onMounted } from 'vue'
 import { formatSize, TMDB_GENRES } from '../utils/logic.js'
 import { showToast } from '../utils/toast.js'
-// [核心] 引入全局弹窗工具，替代 Swal
 import { showConfirm } from '../utils/dialog.js'
 
 // [逻辑完全保持不变]

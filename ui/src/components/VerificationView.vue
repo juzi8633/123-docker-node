@@ -3,6 +3,7 @@ import { ref, onMounted, computed, watch, onUnmounted } from 'vue'
 import { formatSize } from '../utils/logic.js'
 import { dispatchToBackground } from '../utils/dispatcher.js'
 import { showToast } from '../utils/toast.js'
+import { showConfirm } from '../utils/dialog.js'
 
 // =========================
 // 逻辑状态 (保持不变)
@@ -91,16 +92,14 @@ const toggleSelectAll = () => {
 const deleteSelected = async () => {
     if (selectedIds.value.size === 0) return
     
-    const result = await Swal.fire({
+    // 唤起全局确认弹窗
+    const result = await showConfirm({
         title: '确定删除?',
-        text: `将移除 ${selectedIds.value.size} 个任务记录`,
-        icon: 'warning',
-        showCancelButton: true,
-        confirmButtonColor: '#ef4444',
-        cancelButtonColor: '#cbd5e1',
-        confirmButtonText: '删除',
-        cancelButtonText: '取消'
-    })
+        text:  `将移除 ${selectedIds.value.size} 个任务记录`,
+        type: 'danger',
+        confirmText: '确认删除',
+        cancelText: '取消'
+    });
 
     if (!result.isConfirmed) return
 
