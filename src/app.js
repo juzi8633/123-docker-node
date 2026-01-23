@@ -134,7 +134,8 @@ app.get('/api/play/stream', async (req, reply) => {
         if (!downloadUrl) throw new Error("Link generation failed");
         
         logger.info(`[Play] ✅ 获取直链成功 (无状态模式)，执行 302 跳转`);
-        return reply.redirect(302, downloadUrl);
+        // 推荐写法：URL在前，状态码在后（或者省略状态码，默认就是302）
+        return reply.redirect(downloadUrl);
     } catch (e) {
         logger.error(e, `[Play] ❌ 获取直链失败`);
         return reply.code(502).send("Upstream Error");
@@ -668,85 +669,149 @@ async function handleMetadataMigration(newData, reqLogger) {
 }
 
 app.post('/api/submit', async (req, reply) => {
-    const { tmdbId, jsonData, seriesName, seriesYear, type = 'tv', genres = '', sourceType = '123', originalLanguage, originCountry } = req.body;
+    // 1. 解构参数，设置默认值
+    const { 
+        tmdbId, jsonData, seriesName, seriesYear, 
+        type = 'tv', genres = '', sourceType = '123', 
+        originalLanguage, originCountry 
+    } = req.body;
+
     const isSourceTrusted = (sourceType === '123' || sourceType === 'json');
     const nowTime = new Date();
     const nowTimeISO = nowTime.toISOString();
-    const fileCount = jsonData?.files?.length || 0;
+    const files = jsonData?.files || [];
+    const fileCount = files.length;
     
-    logger.info({ seriesName, fileCount, sourceType }, `[Submit] 📥 收到入库请求`);
+    logger.info({ seriesName, fileCount, sourceType }, `[Submit] 📥 收到入库请求 (安全分批版)`);
 
     try {
-        const needRegenerateAll = await handleMetadataMigration({ tmdbId, name: seriesName, year: seriesYear, genres, originalLanguage, originCountry }, req.log);
-        let createdEpisodeIds = [];
+        // 2. [元数据检查] 如果是重名/元数据变更，清理旧 STRM
+        // 注意：handleMetadataMigration 必须在 app.js 外部定义或引入
+        const needRegenerateAll = await handleMetadataMigration({ 
+            tmdbId, name: seriesName, year: seriesYear, genres, originalLanguage, originCountry 
+        }, req.log);
+        
+        // 3. [更新主表] 独立执行，不占用后续长事务
+        await prisma.seriesMain.upsert({
+            where: { tmdbId },
+            update: {
+                name: seriesName, year: seriesYear, type, genres, 
+                originalLanguage, originCountry, lastUpdated: nowTime
+            },
+            create: {
+                tmdbId, name: seriesName, year: seriesYear, type, genres, 
+                originalLanguage, originCountry, lastUpdated: nowTime
+            }
+        });
+        
+        // 变量准备
+        let createdEpisodeIds = []; // 收集 ID 用于生成 STRM
+        let pendingCount = 0;       // 统计待验证任务数
+        
+        // 4. [分批处理核心]
+        const BATCH_SIZE = 50; 
 
-        await prisma.$transaction(async (tx) => {
-            logger.info('[Submit] 开始数据库事务 (Main & Episode)...');
-            await tx.$executeRaw`
-                INSERT INTO series_main (tmdb_id, name, year, type, genres, original_language, origin_country, last_updated) 
-                VALUES (${tmdbId}, ${seriesName}, ${seriesYear}, ${type}, ${genres}, ${originalLanguage}, ${originCountry}, ${nowTimeISO})
-                ON CONFLICT(tmdb_id) DO UPDATE SET 
-                    name=excluded.name, year=excluded.year, type=excluded.type, genres=excluded.genres,
-                    original_language=excluded.original_language, origin_country=excluded.origin_country,
-                    last_updated=excluded.last_updated
-                WHERE (series_main.last_updated < datetime(${nowTimeISO}, '-5 minutes')) OR series_main.last_updated IS NULL
-            `;
+        for (let i = 0; i < files.length; i += BATCH_SIZE) {
+            const batchFiles = files.slice(i, i + BATCH_SIZE);
+            const batchQueueTasks = []; // 本批次需要推送到 Redis 的任务
 
-            if (isSourceTrusted) {
-                req.log.info('[Submit] >>> [可信来源] 正在写入数据库...');
-                for (const file of jsonData.files) {
-                    const { season, episode } = parseSeasonEpisode(file.clean_name, type);
-                    const tier = file.type || 'video';
-                    if (tier !== 'subtitle') await tx.seriesEpisode.deleteMany({ where: { tmdbId, season, episode, type: { not: 'subtitle' } } });
-                    const newEp = await tx.seriesEpisode.create({
-                        data: {
-                            tmdbId, season, episode, cleanName: file.clean_name, etag: file.etag, size: BigInt(file.size), score: file.score || 0, type: tier, createdAt: nowTime
+            // 开启小事务
+            await prisma.$transaction(async (tx) => {
+                if (isSourceTrusted) {
+                    // --- A. 可信来源 (直接入库 SeriesEpisode) ---
+                    for (const file of batchFiles) {
+                        const { season, episode } = parseSeasonEpisode(file.clean_name, type);
+                        const tier = file.type || 'video';
+                        
+                        // 先删后加，防止重复
+                        if (tier !== 'subtitle') {
+                            await tx.seriesEpisode.deleteMany({ 
+                                where: { tmdbId, season, episode, type: { not: 'subtitle' } } 
+                            });
                         }
-                    });
-                    createdEpisodeIds.push(newEp.id);
-                }
-            } else {
-                 req.log.info('[Submit] >>> 进入 [待验证] 分支...');
-                 logger.info('[Submit] 进入待验证队列 (Worker Flow)...');
-                 for (const file of jsonData.files) {
-                    const { season, episode } = parseSeasonEpisode(file.clean_name, type);
-                    const pending = await prisma.pendingEpisode.create({
-                        data: {
-                            tmdbId, season, episode, cleanName: file.clean_name, etag: file.etag, size: BigInt(file.size), score: file.score || 0, type: file.type || 'video', sourceType, sourceRef: file.source_ref || '', taskId: null
-                        }
-                    });
-                    if (pending.id) {
-                        await addToQueue({
-                            id: pending.id, cleanName: file.clean_name, etag: file.etag, size: file.size, tmdbId, season, episode, score: file.score || 0, type: 'verify_rapid', sourceType, sourceRef: file.source_ref || ''
+                        
+                        const newEp = await tx.seriesEpisode.create({
+                            data: {
+                                tmdbId, season, episode, cleanName: file.clean_name, 
+                                etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
+                                type: tier, createdAt: nowTime
+                            }
                         });
-                        await prisma.pendingEpisode.update({ where: { id: pending.id }, data: { taskId: 'QUEUED' } });
+                        createdEpisodeIds.push(newEp.id);
+                    }
+                } else {
+                    // --- B. 待验证来源 (入库 PendingEpisode) ---
+                    for (const file of batchFiles) {
+                        const { season, episode } = parseSeasonEpisode(file.clean_name, type);
+                        
+                        const pending = await tx.pendingEpisode.create({
+                            data: {
+                                tmdbId, season, episode, cleanName: file.clean_name, 
+                                etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
+                                type: file.type || 'video', sourceType, sourceRef: file.source_ref || '', 
+                                taskId: 'QUEUED' // 直接标记为 QUEUED，因为紧接着就会发 Redis
+                            }
+                        });
+
+                        // 收集任务信息，等事务结束后再发 Redis
+                        if (pending.id) {
+                            batchQueueTasks.push({
+                                id: pending.id, cleanName: file.clean_name, 
+                                etag: file.etag, size: file.size, tmdbId, season, episode, 
+                                score: file.score || 0, type: 'verify_rapid', 
+                                sourceType, sourceRef: file.source_ref || ''
+                            });
+                            pendingCount++;
+                        }
                     }
                 }
-            }
-        }, { maxWait: 20000, timeout: 60000 }); 
-        logger.info('[Submit] ✅ 数据库事务已提交');
+            }, { maxWait: 5000, timeout: 10000 }); // 设置 10秒 超时，防止死锁
 
+            // [关键优化] 事务成功提交后，才发送 Redis 任务
+            // 这样避免了 "数据库回滚了但 Redis 任务还在" 的脏数据问题
+            if (batchQueueTasks.length > 0) {
+                // 并发推送到 Redis，提高速度
+                await Promise.all(batchQueueTasks.map(task => addToQueue(task)));
+            }
+
+            // 让出 CPU 10ms，防止阻塞 HTTP 心跳检测和其他并发请求
+            await new Promise(r => setTimeout(r, 10));
+        }
+
+        logger.info('[Submit] ✅ 数据库写入完成，开始后续处理...');
+
+        // 5. [后续处理] 生成 STRM (并发加速)
+        // 我们选择在这里 await，确保用户收到 response 时文件已存在，体验更好
         if (isSourceTrusted && createdEpisodeIds.length > 0) {
-            logger.info({ count: createdEpisodeIds.length }, `[Submit] 🛠️ 开始生成 STRM 文件`);
-            let successCount = 0;
-            let failCount = 0;
-            for (const id of createdEpisodeIds) {
-                try { await strmService.syncEpisode(id); successCount++; } catch (err) { failCount++; }
+            logger.info({ count: createdEpisodeIds.length }, `[Submit] 🛠️ 正在生成 STRM 文件...`);
+            
+            // 使用 Promise.allLimit 或者简单的分块并发，防止文件系统 IO 爆炸
+            // 这里简单起见，使用 20 并发
+            const CHUNK = 20;
+            for (let j = 0; j < createdEpisodeIds.length; j += CHUNK) {
+                const chunkIds = createdEpisodeIds.slice(j, j + CHUNK);
+                await Promise.all(chunkIds.map(id => strmService.syncEpisode(id).catch(e => {
+                    logger.warn({ id, msg: e.message }, '[Submit] STRM 生成轻微报错(可忽略)');
+                })));
             }
-            logger.info({ successCount, failCount }, `[Submit] STRM 生成完毕`);
+            logger.info(`[Submit] STRM 生成完毕`);
         }
 
+        // 6. [迁移处理] 如果元数据变了，重新生成旧的 STRM
         if (needRegenerateAll) {
-            logger.info(`[Migration] 🔄 重新生成全剧 STRM...`);
-            const allEps = await prisma.seriesEpisode.findMany({ where: { tmdbId } });
-            for (const ep of allEps) await strmService.syncEpisode(ep.id).catch(e => {});
+            // 这个可以异步放后台跑，因为不影响新入库的观看
+            (async () => {
+                logger.info(`[Migration] 🔄 后台触发全量 STRM 刷新...`);
+                const allEps = await prisma.seriesEpisode.findMany({ where: { tmdbId } });
+                for (const ep of allEps) await strmService.syncEpisode(ep.id).catch(e => {});
+            })();
         }
 
-        let pendingCount = 0;
-        if (!isSourceTrusted) pendingCount = fileCount;
-        return { success: true, pendingCount };
+        return { success: true, pendingCount: isSourceTrusted ? 0 : pendingCount };
+
     } catch (e) {
         logger.error(e, `[Submit] ❌ 提交处理失败`);
+        // 即使失败，Fastify 也会返回 500，客户端会知道出错了
         return reply.code(500).send({ success: false, error: e.message });
     }
 });
