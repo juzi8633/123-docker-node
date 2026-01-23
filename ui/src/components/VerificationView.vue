@@ -91,7 +91,7 @@ const toggleSelectAll = () => {
 
 const deleteSelected = async () => {
     if (selectedIds.value.size === 0) return
-    
+
     // 唤起全局确认弹窗
     const result = await showConfirm({
         title: '确定删除?',
@@ -101,7 +101,7 @@ const deleteSelected = async () => {
         cancelText: '取消'
     });
 
-    if (!result.isConfirmed) return
+    if (!result) return
 
     try {
         const res = await fetch('./api/pending/delete', {
