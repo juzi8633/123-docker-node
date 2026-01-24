@@ -56,6 +56,17 @@ const app = Fastify({
     bodyLimit: 50 * 1024 * 1024 // 50MB
 });
 
+// [修复 415 错误] 注册 XML 解析器以支持 WebDAV
+// WebDAV 客户端会发送 application/xml 请求，我们需要允许通过
+app.addContentTypeParser(['application/xml', 'text/xml'], (req, payload, done) => {
+    // 我们不需要解析 XML 内容（WebDAV 是只读的），直接读取为字符串防止请求挂起
+    let data = '';
+    payload.on('data', chunk => { data += chunk; });
+    payload.on('end', () => {
+        done(null, data);
+    });
+});
+
 // [优化] 注册压缩插件
 // 设置 threshold 为 1KB，避免压缩太小的包浪费 CPU
 app.register(fastifyCompress, {
