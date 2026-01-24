@@ -3,7 +3,7 @@ import { prisma } from './db.js';
 import { core123 } from './services/core123.js';
 import redis from './redis.js';
 import path from 'path';
-import crypto from 'crypto'; // [新增] 用于生成 Dummy Lock Token
+import crypto from 'crypto';
 
 // ==========================================
 // 配置区域
@@ -16,8 +16,8 @@ const WEBDAV_PASSWORD = process.env.WEBDAV_PASSWORD || "password";
 // ==========================================
 const PREFIX_DIR = 'webdav:dir:';
 const PREFIX_META = 'webdav:meta:';
-const TTL_DIR = 600;      // [修改] 缩短为 10 分钟，避免元数据长期不更新
-const TTL_META = 3600;    // [修改] 文件元数据 1 小时
+const TTL_DIR = 600;      // 目录缓存 10 分钟
+const TTL_META = 3600;    // 文件元数据缓存 1 小时
 
 /**
  * 主动清除 WebDAV 缓存
@@ -25,16 +25,10 @@ const TTL_META = 3600;    // [修改] 文件元数据 1 小时
 export async function invalidateWebdavCache() {
     try {
         const stream = redis.scanStream({ match: 'webdav:*', count: 100 });
-        let deletedCount = 0;
         stream.on('data', (keys) => {
-            if (keys.length) {
-                redis.unlink(keys);
-                deletedCount += keys.length;
-            }
+            if (keys.length) redis.unlink(keys);
         });
-        stream.on('end', () => {
-            console.log(`[WebDAV] 🧹 缓存已主动清除 (~${deletedCount} keys)`);
-        });
+        stream.on('end', () => console.log(`[WebDAV] 🧹 Cache cleared`));
     } catch (e) {
         console.error('[WebDAV] Cache clear failed', e);
     }
@@ -59,11 +53,16 @@ const CATEGORY_MAP = {
 // 工具函数
 // ==========================================
 
-// [新增] 路径名称清洗：防止数据库中的名称包含 / 导致 split 路径错误
+// [🔧 路径安全清洗] 防止文件名包含 / 导致 WebDAV 目录死循环
 function sanitizeName(name) {
     if (!name) return "Unknown";
-    // 将半角斜杠替换为全角，既保证视觉相似，又不会破坏 URL 结构
+    // 将半角斜杠替换为全角，视觉相似但不会破坏 URL 结构
     return String(name).replace(/\//g, '／').replace(/\\/g, '＼');
+}
+
+// 计算 ETag (MD5) 用于 304 协商缓存
+function calculateETag(str) {
+    return '"' + crypto.createHash('md5').update(str).digest('hex') + '"';
 }
 
 function escapeXml(unsafe) {
@@ -78,43 +77,33 @@ function escapeXml(unsafe) {
 function getMimeType(filename) {
     const ext = path.extname(filename).toLowerCase();
     const map = {
-        '.mp4': 'video/mp4',
-        '.mkv': 'video/x-matroska',
-        '.avi': 'video/x-msvideo',
-        '.mov': 'video/quicktime',
-        '.strm': 'application/vnd.apple.mpegurl',
-        '.srt': 'text/plain',
-        '.ass': 'text/plain',
-        '.vtt': 'text/vtt',
-        '.jpg': 'image/jpeg',
-        '.png': 'image/png',
-        '.nfo': 'text/xml'
+        '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.jpg': 'image/jpeg', '.png': 'image/png',
+        '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.strm': 'application/vnd.apple.mpegurl',
+        '.srt': 'text/plain', '.ass': 'text/plain', '.vtt': 'text/vtt', '.nfo': 'text/xml'
     };
     return map[ext] || 'application/octet-stream';
 }
 
-function generatePropXML(href, displayName, isCollection, size = 0, lastMod = new Date(), etag = "") {
+// XML 构建器 (Array Push 模式，高性能)
+function appendPropXML(partsArr, href, displayName, isCollection, size = 0, lastMod, etag = "") {
     const dateObj = (lastMod instanceof Date) ? lastMod : new Date(lastMod || 0);
-    // [修正] creationdate 应使用 ISO 8601
     const creation = dateObj.toISOString(); 
-    // [修正] lastmodified 应使用 RFC 1123
     const lastModified = dateObj.toUTCString();
     
     let safeHref = escapeXml(href);
-    // 规范化：WebDAV 要求集合以 / 结尾
+    // 规范：WebDAV 集合必须以 / 结尾
     if (isCollection && !safeHref.endsWith('/')) safeHref += '/';
 
     const resourceType = isCollection ? "<D:collection/>" : "";
     const contentLength = isCollection ? "" : `<D:getcontentlength>${size}</D:getcontentlength>`;
     const contentType = isCollection ? "" : `<D:getcontenttype>${getMimeType(displayName)}</D:getcontenttype>`;
-    // [优化] ETag 添加引号包裹，符合 RFC
     const etagNode = etag ? `<D:getetag>"${etag}"</D:getetag>` : "";
     
-    // [新增] Win32 属性支持 (可选，提高 Windows 兼容性)
-    // isCollection ? 10 (Directory) : 20 (Archive)
+    // [🛡️ Windows 兼容] Win32FileAttributes: 10=Directory, 20=File (Archive)
+    // 这能让资源管理器更快识别文件类型，减少探测
     const fileAttributes = isCollection ? "10" : "20";
 
-    return `
+    partsArr.push(`
     <D:response>
         <D:href>${safeHref}</D:href>
         <D:propstat>
@@ -126,17 +115,17 @@ function generatePropXML(href, displayName, isCollection, size = 0, lastMod = ne
                 ${contentLength}
                 ${contentType}
                 ${etagNode}
+                <D:Win32FileAttributes>${fileAttributes}</D:Win32FileAttributes>
             </D:prop>
             <D:status>HTTP/1.1 200 OK</D:status>
         </D:propstat>
-    </D:response>`;
+    </D:response>`);
 }
 
 // ==========================================
 // 核心请求处理器
 // ==========================================
 export async function handleWebDavRequest(req, reply) {
-    // 1. Basic Auth
     const auth = req.headers['authorization'];
     if (!auth) {
         reply.header('WWW-Authenticate', 'Basic realm="123NodeServer"');
@@ -147,9 +136,8 @@ export async function handleWebDavRequest(req, reply) {
     const [user, pass] = Buffer.from(encoded, 'base64').toString().split(':');
     if (user !== WEBDAV_USER || pass !== WEBDAV_PASSWORD) return reply.code(403).send('Forbidden');
 
-    // 2. 路径解析
-    // [修正] 移除末尾斜杠可能导致根目录判断错误，需谨慎处理
     let urlPath = decodeURIComponent(req.raw.url.replace(/^\/webdav/, '').split('?')[0]);
+    // 移除末尾斜杠，统一处理逻辑 (根目录除外)
     if (urlPath.length > 1 && urlPath.endsWith('/')) urlPath = urlPath.slice(0, -1);
     
     const parts = urlPath.split('/').filter(p => p);
@@ -157,40 +145,30 @@ export async function handleWebDavRequest(req, reply) {
 
     try {
         switch (method) {
-            case 'PROPFIND':
-                return await handlePropfind(req, reply, urlPath, parts);
+            case 'PROPFIND': return await handlePropfind(req, reply, urlPath, parts);
             case 'GET':
-            case 'HEAD':
-                return await handleGet(req, reply, urlPath, parts);
+            case 'HEAD': return await handleGet(req, reply, urlPath, parts);
+            
+            // [🛡️ Windows 兼容] 声明支持的方法
             case 'OPTIONS':
-                // [新增] 增强的 OPTIONS 头，声明支持 Locking
                 reply.header('DAV', '1, 2');
                 reply.header('Allow', 'OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, LOCK, UNLOCK');
-                reply.header('MS-Author-Via', 'DAV');
+                reply.header('MS-Author-Via', 'DAV'); // 增强兼容性
                 return reply.send();
             
-            // [新增] 兼容性：处理 PROPPATCH (Windows 挂载需要)
-            case 'PROPPATCH':
-                return handleDummyProppatch(reply, urlPath);
-            
-            // [新增] 兼容性：处理 LOCK (Windows 挂载需要)
-            case 'LOCK':
-                return handleDummyLock(req, reply, urlPath);
-            
-            // [新增] 兼容性：处理 UNLOCK
-            case 'UNLOCK':
-                return reply.code(204).send();
+            // [🛡️ Windows 兼容] 哑巴接口实现
+            case 'PROPPATCH': return handleDummyProppatch(reply, urlPath);
+            case 'LOCK': return handleDummyLock(req, reply, urlPath);
+            case 'UNLOCK': return reply.code(204).send();
 
-            // [新增] 明确拒绝写入操作
+            // 明确拒绝写入
             case 'PUT':
             case 'DELETE':
             case 'MKCOL':
             case 'MOVE':
-            case 'COPY':
-                return reply.code(403).send('Read-only file system');
-
-            default:
-                return reply.code(405).send('Method Not Allowed');
+            case 'COPY': return reply.code(403).send('Read-only file system');
+            
+            default: return reply.code(405).send('Method Not Allowed');
         }
     } catch (e) {
         req.log.error(e, `[WebDAV] Error handling ${urlPath}`);
@@ -206,62 +184,80 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     const cacheKey = `${PREFIX_DIR}${pathStr}:${depth}`;
     
+    // 1. 缓存层 (支持 304 协商)
     const cachedXml = await redis.get(cacheKey);
-    if (cachedXml) return sendXml(reply, cachedXml);
+    if (cachedXml) {
+        const etag = calculateETag(cachedXml);
+        if (req.headers['if-none-match'] === etag) {
+            return reply.code(304).send();
+        }
+        reply.header('ETag', etag);
+        return sendXml(reply, cachedXml);
+    }
 
-    let xmlContent = "";
-    const basePath = `/webdav${pathStr === '/' ? '' : pathStr}`;
-
-    // 1. 添加自身 (Self Entry)
-    // 注意：如果是根目录，displayName 是 '/'，否则取路径最后一段
+    // 2. 数据构建
+    const xmlParts = [];
+    
+    // [🔧 路径安全] 强制使用 encodeURIComponent 构建 href，防止路径解析歧义
+    // 如果 pathStr 是 "/电影/Face/Off"，parts 是 ["电影", "Face", "Off"] -> 错误
+    // 如果 pathStr 是 "/电影/Face／Off"，parts 是 ["电影", "Face／Off"] -> 正确
+    // 这里我们重新构建 href 确保它是 URI 编码的
+    const encodedPathStr = parts.map(p => encodeURIComponent(p)).join('/');
+    const basePathForXml = `/webdav${encodedPathStr ? '/' + encodedPathStr : ''}`;
     const selfName = parts.length > 0 ? parts[parts.length - 1] : '/';
-    xmlContent += generatePropXML(basePath, selfName, true);
+    
+    // 添加 Self Entry
+    appendPropXML(xmlParts, basePathForXml, selfName, true);
 
     if (depth !== '0') {
-        // Level 0: 根目录
+        // Level 0: Root
         if (parts.length === 0) {
-            xmlContent += generatePropXML(`${basePath}/电影`, '电影', true);
-            xmlContent += generatePropXML(`${basePath}/电视剧`, '电视剧', true);
+            appendPropXML(xmlParts, `${basePathForXml}/电影`, '电影', true);
+            appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true);
         }
         
-        // Level 1: 大类 (电影/电视剧)
+        // Level 1: Categories
         else if (parts.length === 1) {
             const typeFolder = parts[0]; 
             const isMovie = typeFolder === '电影';
+            const categories = Object.entries(CATEGORY_MAP);
 
-            for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
+            for (const [catName, condition] of categories) {
                 if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
-                    xmlContent += generatePropXML(`${basePath}/${catName}`, catName, true);
+                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(catName)}`, catName, true);
                 }
             }
-            xmlContent += generatePropXML(`${basePath}/未分类`, '未分类', true);
+            appendPropXML(xmlParts, `${basePathForXml}/未分类`, '未分类', true);
         }
         
-        // Level 2: 具体分类 -> 剧集/电影名
+        // Level 2: Series List
         else if (parts.length === 2) {
             const [typeFolder, category] = parts;
             const condition = CATEGORY_MAP[category] || { type: typeFolder === '电影' ? 'movie' : 'tv' };
             
+            // [⚡️ DB 瘦身] 仅查询显示列表需要的 4 个字段
             const seriesList = await prisma.seriesMain.findMany({
                 where: condition,
-                select: { tmdbId: true, name: true, year: true, lastUpdated: true },
+                select: { 
+                    tmdbId: true, 
+                    name: true, 
+                    year: true, 
+                    lastUpdated: true 
+                },
                 orderBy: { lastUpdated: 'desc' }
             });
 
             for (const s of seriesList) {
-                // [安全处理] 使用 sanitizeName 处理显示名称
+                // [🔧 路径安全] 清洗数据库中的名称 (如 "Face/Off" -> "Face／Off")
                 const safeNameStr = sanitizeName(s.name);
                 const folderName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
-                
-                // 必须对路径部分进行 URI 编码
-                xmlContent += generatePropXML(`${basePath}/${encodeURIComponent(folderName)}`, folderName, true, 0, s.lastUpdated);
+                appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(folderName)}`, folderName, true, 0, s.lastUpdated);
             }
         }
         
-        // Level 3: 剧集/电影目录 -> 季 或 文件
+        // Level 3: Files (Movie) or Seasons (TV)
         else if (parts.length === 3) {
             const [typeFolder, category, seriesFolder] = parts;
-            // 依赖 ID 匹配，不受名称清洗影响
             const tmdbIdMatch = seriesFolder.match(/\{tmdb-(\d+)\}/);
 
             if (tmdbIdMatch) {
@@ -269,19 +265,19 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 const isMovie = typeFolder === '电影';
 
                 if (isMovie) {
+                    // [⚡️ DB 瘦身] 仅查询文件列表需要的 4 个核心字段
                     const files = await prisma.seriesEpisode.findMany({ 
-                        where: { tmdbId, type: { not: 'subtitle' } } 
+                        where: { tmdbId, type: { not: 'subtitle' } },
+                        select: { 
+                            cleanName: true, 
+                            size: true, 
+                            createdAt: true, 
+                            etag: true 
+                        }
                     });
                     for (const f of files) {
-                        xmlContent += generatePropXML(
-                            `${basePath}/${encodeURIComponent(f.cleanName)}`,
-                            f.cleanName, // 文件名通常是 clean 的，暂不 sanitize
-                            false, 
-                            Number(f.size), 
-                            f.createdAt, 
-                            f.etag
-                        );
-                        cacheFileMeta(f); 
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, Number(f.size), f.createdAt, f.etag);
+                        cacheFileMeta(f, tmdbId);
                     }
                 } else {
                     const seasons = await prisma.seriesEpisode.groupBy({
@@ -293,13 +289,13 @@ async function handlePropfind(req, reply, pathStr, parts) {
 
                     for (const s of seasons) {
                         const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
-                        xmlContent += generatePropXML(`${basePath}/${encodeURIComponent(seasonName)}`, seasonName, true);
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true);
                     }
                 }
             }
         }
         
-        // Level 4: Season -> 分集
+        // Level 4: Episodes (TV)
         else if (parts.length === 4) {
             const [typeFolder, category, seriesFolder, seasonFolder] = parts;
             const tmdbIdMatch = seriesFolder.match(/\{tmdb-(\d+)\}/);
@@ -309,42 +305,46 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 const tmdbId = parseInt(tmdbIdMatch[1]);
                 const season = parseInt(seasonMatch[1]);
                 
+                // [⚡️ DB 瘦身] 仅查询文件列表需要的 4 个核心字段
                 const files = await prisma.seriesEpisode.findMany({
                     where: { tmdbId, season, type: { not: 'subtitle' } }, 
+                    select: { 
+                        cleanName: true, 
+                        size: true, 
+                        createdAt: true, 
+                        etag: true 
+                    },
                     orderBy: { episode: 'asc' }
                 });
 
                 for (const f of files) {
-                    xmlContent += generatePropXML(
-                        `${basePath}/${encodeURIComponent(f.cleanName)}`,
-                        f.cleanName, 
-                        false, 
-                        Number(f.size), 
-                        f.createdAt, 
-                        f.etag
-                    );
-                    cacheFileMeta(f);
+                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, Number(f.size), f.createdAt, f.etag);
+                    cacheFileMeta(f, tmdbId);
                 }
             }
         }
     }
 
-    const finalXml = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${xmlContent}</D:multistatus>`;
+    const finalXml = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${xmlParts.join('')}</D:multistatus>`;
+    
     await redis.set(cacheKey, finalXml, 'EX', TTL_DIR);
+    
+    // 返回带 ETag
+    const etag = calculateETag(finalXml);
+    reply.header('ETag', etag);
     return sendXml(reply, finalXml);
 }
 
 async function handleGet(req, reply, pathStr, parts) {
     const fileName = decodeURIComponent(parts[parts.length - 1]);
     
-    // 1. 尝试从路径中提取 TMDB ID (递归向上查找)
     let tmdbId = null;
     const pathMatch = pathStr.match(/\{tmdb-(\d+)\}/);
     if (pathMatch) tmdbId = parseInt(pathMatch[1]);
 
     if (!tmdbId) return reply.code(404).send('File context not found');
 
-    // 2. 查找文件元数据 (优先查 Redis)
+    // 1. 元数据查询
     const cacheKey = `${PREFIX_META}${tmdbId}:${fileName}`;
     const cachedMetaStr = await redis.get(cacheKey);
     
@@ -353,9 +353,15 @@ async function handleGet(req, reply, pathStr, parts) {
         file = JSON.parse(cachedMetaStr);
         file.createdAt = new Date(file.createdAt);
     } else {
+        // [⚡️ DB 瘦身] 仅查询获取下载链接和响应头需要的 4 个字段
         file = await prisma.seriesEpisode.findFirst({
             where: { tmdbId, cleanName: fileName },
-            select: { cleanName: true, etag: true, size: true, createdAt: true }
+            select: { 
+                cleanName: true, 
+                etag: true, 
+                size: true, 
+                createdAt: true 
+            }
         });
         if (file) {
             await redis.set(cacheKey, JSON.stringify(file), 'EX', TTL_META);
@@ -372,31 +378,28 @@ async function handleGet(req, reply, pathStr, parts) {
         'Accept-Ranges': 'bytes'
     };
 
-    // [优化] HEAD 请求直接返回，不触发后端直链获取逻辑
+    // [⚡️ 性能优化] HEAD 请求直接返回，不触发直链获取
     if (req.method === 'HEAD') {
         reply.headers(headers);
         return reply.send();
     }
 
-    // 3. 获取下载直链 (仅 GET)
+    // 2. 获取直链 (仅 GET)
     try {
         const downloadUrl = await core123.getDownloadUrlByHash(file.cleanName, file.etag, Number(file.size));
-        
         if (!downloadUrl) throw new Error('Link generation failed');
 
-        req.log.info({ file: fileName, ip: req.ip }, `[WebDAV] Redirecting stream`);
+        req.log.info({ file: fileName }, `[WebDAV] Redirect -> Stream`);
         return reply.redirect(downloadUrl);
     } catch (e) {
-        req.log.error(e, `[WebDAV] Failed to get link for ${fileName}`);
+        req.log.error(e, `[WebDAV] Link Error: ${fileName}`);
         return reply.code(502).send('Upstream Error');
     }
 }
 
-// [新增] 假装成功的 PROPPATCH (欺骗 Windows)
+// [🛡️ Windows 兼容] 假装成功的 PROPPATCH
 function handleDummyProppatch(reply, urlPath) {
-    // 返回 MultiStatus 告诉客户端 "属性设置失败/忽略，但我收到了" 或者直接返回 "OK"
-    // 最简单的欺骗是告诉它设置成功了，或者对应的属性 403 但整体 207
-    // 这里使用一个通用的成功模板
+    // Windows 试图设置属性时，返回成功或 MultiStatus 207
     const xml = `<?xml version="1.0" encoding="utf-8" ?>
 <D:multistatus xmlns:D="DAV:">
     <D:response>
@@ -410,7 +413,7 @@ function handleDummyProppatch(reply, urlPath) {
     return sendXml(reply, xml);
 }
 
-// [新增] 假装成功的 LOCK (欺骗 Windows)
+// [🛡️ Windows 兼容] 假装成功的 LOCK
 function handleDummyLock(req, reply, urlPath) {
     const token = `urn:uuid:${crypto.randomUUID()}`;
     const xml = `<?xml version="1.0" encoding="utf-8" ?>
@@ -432,21 +435,12 @@ function handleDummyLock(req, reply, urlPath) {
 }
 
 function sendXml(reply, xml) {
-    return reply
-        .type('application/xml; charset=utf-8')
-        .header('DAV', '1, 2')
-        .status(207)
-        .send(xml);
+    return reply.type('application/xml; charset=utf-8').header('DAV', '1, 2').status(207).send(xml);
 }
 
-async function cacheFileMeta(f) {
-    const key = `${PREFIX_META}${f.tmdbId}:${f.cleanName}`;
-    const data = { 
-        cleanName: f.cleanName, 
-        etag: f.etag, 
-        size: Number(f.size), 
-        createdAt: f.createdAt 
-    };
-    // 异步写入缓存，不阻塞
-    redis.set(key, JSON.stringify(data), 'EX', TTL_META).catch(e => console.error(e));
+function cacheFileMeta(f, tmdbId) {
+    // 异步写入缓存
+    const key = `${PREFIX_META}${tmdbId}:${f.cleanName}`;
+    const data = { cleanName: f.cleanName, etag: f.etag, size: Number(f.size), createdAt: f.createdAt };
+    redis.set(key, JSON.stringify(data), 'EX', TTL_META).catch(() => {});
 }

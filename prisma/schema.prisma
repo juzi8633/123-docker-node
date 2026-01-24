@@ -28,6 +28,9 @@ model SeriesMain {
   lastUpdated     DateTime @default(now()) @map("last_updated")
   
   episodes        SeriesEpisode[]
+
+  @@index([type, originalLanguage])
+  @@index([type, genres])
   @@map("series_main")
 }
 
@@ -51,6 +54,14 @@ model SeriesEpisode {
 
   series      SeriesMain @relation(fields: [tmdbId], references: [tmdbId], onDelete: Cascade)
 
+// [性能优化] 核心查询索引
+  // 场景1: 查某部电影的所有文件 -> where tmdbId
+  // 场景2: 查某部剧某季的所有文件 -> where tmdbId, season
+  @@index([tmdbId, season, type]) 
+  @@index([tmdbId, type])
+  
+  // [性能优化] 文件名反查索引 (用于 handleGet)
+  @@index([tmdbId, cleanName])
   @@index([tmdbId, season, episode])
   @@map("series_episodes")
 }
