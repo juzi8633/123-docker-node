@@ -1,4 +1,4 @@
-// src/webdav-server.js
+// src/webdav.js
 import { prisma } from './db.js';
 import { core123 } from './services/core123.js';
 import redis from './redis.js';
@@ -12,6 +12,10 @@ import { LRUCache } from 'lru-cache';
 const WEBDAV_USER = process.env.WEBDAV_USER || "admin";
 const WEBDAV_PASSWORD = process.env.WEBDAV_PASSWORD || "password";
 
+// [核心优化] 服务启动时间锚点
+// 用于静态目录（根目录、分类目录），保证 XML 内容稳定，使 ETag 稳定，从而让 304 缓存生效。
+const STARTUP_TIME = new Date(); 
+
 // ==========================================
 // 缓存策略 (三级缓存体系)
 // ==========================================
@@ -20,19 +24,17 @@ const PREFIX_META = 'webdav:meta:';
 const TTL_REDIS_DIR = 600;      // L2 (Redis) 目录缓存 10 分钟
 const TTL_REDIS_META = 3600;    // L2 (Redis) 元数据缓存 1 小时
 
-// [⚡️ L1 内存缓存]：应对毫秒级并发风暴 (如 Infuse 扫库)
-// max: 最多缓存 1000 个对象
-// ttl: 5秒 (足够应付瞬间并发，保证数据新鲜度)
+// [⚡️ L1 内存缓存]
 const lruCache = new LRUCache({
     max: 1000,
     ttl: 1000 * 5, 
 });
 
-// [⚡️ 静态 XML 缓存]：Level 0 (根) 和 Level 1 (分类) 几乎永不变化，直接内存直出
+// [⚡️ 静态 XML 缓存]
 const staticXmlCache = new Map();
 
 /**
- * 主动清除 WebDAV 缓存 (同时清理 L1, Static, L2)
+ * 主动清除 WebDAV 缓存 (全量清除 - 兜底用)
  */
 export async function invalidateWebdavCache() {
     try {
@@ -45,6 +47,37 @@ export async function invalidateWebdavCache() {
         stream.on('end', () => console.log(`[WebDAV] 🧹 All Caches (L1/Static/Redis) cleared`));
     } catch (e) {
         console.error('[WebDAV] Cache clear failed', e);
+    }
+}
+
+/**
+ * [新增] 精准清除指定剧集的缓存 (增量更新用)
+ * @param {number|string} tmdbId - 剧集的 TMDB ID
+ */
+export async function invalidateCacheByTmdbId(tmdbId) {
+    if (!tmdbId) return;
+    const tmdbStr = String(tmdbId);
+    
+    // console.log(`[WebDAV] 🧹 Granular cache clear for TMDB: ${tmdbStr}`);
+
+    try {
+        // 1. 清除 L1 内存缓存
+        lruCache.clear();
+
+        // 2. 清除 Redis 中该剧集的文件元数据 (Metadata)
+        const metaStream = redis.scanStream({ match: `${PREFIX_META}${tmdbStr}:*`, count: 100 });
+        metaStream.on('data', (keys) => {
+            if (keys.length) redis.unlink(keys);
+        });
+
+        // 3. 清除该剧集的目录结构 (Directory XML)
+        const dirStream = redis.scanStream({ match: `${PREFIX_DIR}*tmdb-${tmdbStr}*`, count: 100 });
+        dirStream.on('data', (keys) => {
+            if (keys.length) redis.unlink(keys);
+        });
+
+    } catch (e) {
+        console.error('[WebDAV] Granular clear failed', e);
     }
 }
 
@@ -61,17 +94,16 @@ const CATEGORY_MAP = {
     '纪录片': { type: 'tv', genres: { contains: '99' } },
     '综艺':   { type: 'tv', genres: { contains: '10764' } },
     '儿童':   { type: 'tv', genres: { contains: '10762' } },
-    // [补丁] 捕获所有不属于上述语言/类型的其他剧集 (泰剧、德剧等)，防止消失
     '未分类': { 
         type: 'tv', 
         NOT: [
             { originalLanguage: 'zh' }, { originalLanguage: 'cn' },
             { originalLanguage: 'en' },
             { originalLanguage: 'ja' }, { originalLanguage: 'ko' },
-            { genres: { contains: '16' } },    // 排除动漫
-            { genres: { contains: '99' } },    // 排除纪录片
-            { genres: { contains: '10764' } }, // 排除综艺
-            { genres: { contains: '10762' } }  // 排除儿童
+            { genres: { contains: '16' } },    
+            { genres: { contains: '99' } },    
+            { genres: { contains: '10764' } }, 
+            { genres: { contains: '10762' } }  
         ]
     }
 };
@@ -80,14 +112,11 @@ const CATEGORY_MAP = {
 // 工具函数
 // ==========================================
 
-// [🔧 路径安全清洗] 防止文件名包含 / 导致 WebDAV 目录死循环
 function sanitizeName(name) {
     if (!name) return "Unknown";
-    // 将半角斜杠替换为全角，视觉相似但不会破坏 URL 结构
     return String(name).replace(/\//g, '／').replace(/\\/g, '＼');
 }
 
-// 计算 ETag (MD5) 用于 304 协商缓存
 function calculateETag(str) {
     return '"' + crypto.createHash('md5').update(str).digest('hex') + '"';
 }
@@ -111,9 +140,25 @@ function getMimeType(filename) {
     return map[ext] || 'application/octet-stream';
 }
 
-// XML 构建器 (Array Push 模式，避免字符串拼接的内存压力)
+/**
+ * [优化] XML 构建器 - 时间处理逻辑增强
+ * 策略：
+ * 1. 静态目录 (Level 0/1) -> 传入 STARTUP_TIME。保证 ETag 稳定。
+ * 2. 动态目录 (Level 2/3) -> 传入 DB 中的时间。保证内容更新后时间变动。
+ * 3. 兜底 -> 如果 DB 时间为空，回退到 STARTUP_TIME，避免 1970 问题。
+ */
 function appendPropXML(partsArr, href, displayName, isCollection, size = 0, lastMod, etag = "") {
-    const dateObj = (lastMod instanceof Date) ? lastMod : new Date(lastMod || 0);
+    let dateObj;
+    if (lastMod instanceof Date) {
+        dateObj = lastMod;
+    } else if (lastMod) {
+        dateObj = new Date(lastMod);
+    } else {
+        // [修正] 默认为启动时间，而不是当前时间。避免每次请求 XML 内容变动导致 ETag 失效。
+        dateObj = STARTUP_TIME;
+    }
+    
+    // WebDAV 推荐格式
     const creation = dateObj.toISOString(); 
     const lastModified = dateObj.toUTCString();
     
@@ -210,7 +255,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     const cacheKey = `${PREFIX_DIR}${pathStr}:${depth}`;
     
-    // [⚡️ 优化 1] L1 内存缓存命中 (Check L1)
+    // [⚡️ 优化 1] L1 内存缓存命中
     if (lruCache.has(cacheKey)) {
         const cachedXml = lruCache.get(cacheKey);
         const etag = calculateETag(cachedXml);
@@ -219,12 +264,12 @@ async function handlePropfind(req, reply, pathStr, parts) {
         return sendXml(reply, cachedXml);
     }
     
-    // [⚡️ 优化 2] 静态路径直出 (Check Static)
+    // [⚡️ 优化 2] 静态路径直出
     if (staticXmlCache.has(cacheKey)) {
         return sendXml(reply, staticXmlCache.get(cacheKey));
     }
 
-    // [⚡️ 优化 3] L2 Redis 缓存命中 (Check L2)
+    // [⚡️ 优化 3] L2 Redis 缓存命中
     const cachedXml = await redis.get(cacheKey);
     if (cachedXml) {
         lruCache.set(cacheKey, cachedXml); // 回填 L1
@@ -242,13 +287,16 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const basePathForXml = `/webdav${encodedPathStr ? '/' + encodedPathStr : ''}`;
     const selfName = parts.length > 0 ? parts[parts.length - 1] : '/';
     
-    appendPropXML(xmlParts, basePathForXml, selfName, true);
+    // [修正] 自身属性：统一使用 STARTUP_TIME，确保进入目录时属性稳定
+    // 虽然这里不查 DB 牺牲了一点真实性，但换来了无需 DB 查询的高性能 "Self" 节点生成
+    appendPropXML(xmlParts, basePathForXml, selfName, true, 0, STARTUP_TIME);
 
     if (depth !== '0') {
         // Level 0: Root
         if (parts.length === 0) {
-            appendPropXML(xmlParts, `${basePathForXml}/电影`, '电影', true);
-            appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true);
+            // [修正] 使用 STARTUP_TIME
+            appendPropXML(xmlParts, `${basePathForXml}/电影`, '电影', true, 0, STARTUP_TIME);
+            appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true, 0, STARTUP_TIME);
         }
         
         // Level 1: Categories
@@ -259,22 +307,18 @@ async function handlePropfind(req, reply, pathStr, parts) {
 
             for (const [catName, condition] of categories) {
                 if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
-                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(catName)}`, catName, true);
+                    // [修正] 使用 STARTUP_TIME
+                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(catName)}`, catName, true, 0, STARTUP_TIME);
                 }
             }
-            // [🐛 修复] 移除了 "未分类" 生成代码，防止与华语/外语/其他分类重叠导致重复
         }
         
         // Level 2: Series List
         else if (parts.length === 2) {
             const [typeFolder, category] = parts;
-            // 获取查询条件
             const condition = CATEGORY_MAP[category];
             
-            // [🛡️ 安全防护] 如果 category 不在 Map 中 (比如用户手动输入了URL)，直接返回空列表
-            // 不再使用兜底逻辑，防止 "未分类" 变成 "全部分类"
             if (condition) {
-                // [⚡️ DB 瘦身] Select 4个核心字段
                 const seriesList = await prisma.seriesMain.findMany({
                     where: condition,
                     select: { 
@@ -287,9 +331,9 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 });
 
                 for (const s of seriesList) {
-                    // [🔧 路径安全] 清洗数据库名称
                     const safeNameStr = sanitizeName(s.name);
                     const folderName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
+                    // [真实] 使用 DB 中的 lastUpdated
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(folderName)}`, folderName, true, 0, s.lastUpdated);
                 }
             }
@@ -310,19 +354,23 @@ async function handlePropfind(req, reply, pathStr, parts) {
                         select: { cleanName: true, size: true, createdAt: true, etag: true }
                     });
                     for (const f of files) {
+                        // [真实] 使用 DB 中的 createdAt
                         appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, Number(f.size), f.createdAt, f.etag);
                         cacheFileMeta(f, tmdbId);
                     }
                 } else {
+                    // [关键修正] 聚合查询：获取每季最新时间
                     const seasons = await prisma.seriesEpisode.groupBy({
                         by: ['season'], 
                         where: { tmdbId, type: { not: 'subtitle' } }, 
-                        _count: true
+                        _max: { createdAt: true } // <--- 重点：获取该季最新一集的添加时间
                     });
                     seasons.sort((a, b) => a.season - b.season);
                     for (const s of seasons) {
                         const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
-                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true);
+                        // 使用 _max.createdAt 作为季文件夹的时间
+                        const seasonDate = s._max.createdAt || STARTUP_TIME;
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true, 0, seasonDate);
                     }
                 }
             }
@@ -406,7 +454,7 @@ async function handleGet(req, reply, pathStr, parts) {
     const headers = {
         'Content-Type': getMimeType(fileName),
         'Content-Length': String(file.size),
-        'Last-Modified': new Date(file.createdAt).toUTCString(),
+        'Last-Modified': new Date(file.createdAt).toUTCString(), // 真实的文件创建时间
         'ETag': `"${file.etag}"`,
         'Accept-Ranges': 'bytes'
     };

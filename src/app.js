@@ -10,8 +10,8 @@ import crypto from 'node:crypto';
 // [优化] 引入压缩插件，解决 XML 传输瓶颈
 import fastifyCompress from '@fastify/compress'; 
 
-// [优化] 引入 WebDAV 处理器和缓存清除工具
-import { handleWebDavRequest, invalidateWebdavCache } from './webdav.js';
+// [修改] 引入新的精准清除函数 invalidateCacheByTmdbId
+import { handleWebDavRequest, invalidateWebdavCache, invalidateCacheByTmdbId } from './webdav.js';
 
 // 引入核心模块
 import { addToQueue } from './queue.js';
@@ -477,9 +477,11 @@ app.post('/api/webhook/emby', async (req, reply) => {
             logger.info({ count: deletedCount }, `[Webhook] ✅ 整季已清理`);
         }
 
-        // [新增] 如果有内容被删除，清理 WebDAV 缓存
-        if (deletedCount > 0) {
-            invalidateWebdavCache();
+        // [修改] 如果有内容被删除，精准清理 WebDAV 缓存
+        if (deletedCount > 0 && tmdbId) {
+            await invalidateCacheByTmdbId(tmdbId);
+        } else if (deletedCount > 0) {
+            invalidateWebdavCache(); // 兜底
         }
 
         return { success: true, deletedCount };
@@ -937,7 +939,12 @@ app.post('/api/submit', async (req, reply) => {
             })();
         }
 
-        invalidateWebdavCache(); // [新增] 数据变动，主动清除 WebDAV 缓存
+        // [修改] 尝试精准清除，如果 tmdbId 存在
+        if (tmdbId) {
+            invalidateCacheByTmdbId(tmdbId).catch(err => logger.warn({ tmdbId, err }, 'Cache invalidation failed'));
+        } else {
+            invalidateWebdavCache(); // 兜底全量清除
+        }
 
         return { success: true, pendingCount: isSourceTrusted ? 0 : pendingCount };
 
@@ -962,7 +969,12 @@ app.delete('/api/delete/series', async (req, reply) => {
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
     ]);
 
-    invalidateWebdavCache(); // [新增] 删除后清理缓存
+    // [修改] 精准清除缓存
+    if (id) {
+        await invalidateCacheByTmdbId(id);
+    } else {
+        invalidateWebdavCache();
+    }
 
     return { success: true, id };
 });
@@ -971,12 +983,21 @@ app.delete('/api/delete/episode', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id || isNaN(id)) return { error: "Missing Row ID" };
     const ep = await prisma.seriesEpisode.findUnique({ where: { id }, include: { series: true } });
+    
+    let tmdbId = null;
+
     if (ep) {
+        tmdbId = ep.tmdbId; // 记录 ID 用于清除缓存
         await strmService.deleteEpisode({ ...ep, series: ep.series });
         await prisma.seriesEpisode.delete({ where: { id } });
     }
 
-    invalidateWebdavCache(); // [新增] 删除后清理缓存
+    // [修改] 精准清除缓存
+    if (tmdbId) {
+        await invalidateCacheByTmdbId(tmdbId);
+    } else {
+        invalidateWebdavCache();
+    }
 
     return { success: true, id };
 });
@@ -1043,7 +1064,12 @@ app.post('/api/webhook/upload', async (req, reply) => {
         id: -1, cleanName: standardizedName, type: 'verify_rapid', etag, size, tmdbId, season, episode, score: newScore, sourceType: 'webhook'
     });
 
-    invalidateWebdavCache(); // [新增] Webhook 上传后清理缓存
+    // [修改] 精准清除缓存
+    if (tmdbId) {
+        await invalidateCacheByTmdbId(tmdbId);
+    } else {
+        invalidateWebdavCache();
+    }
 
     return { status: 'ok', new_name: standardizedName };
 });
