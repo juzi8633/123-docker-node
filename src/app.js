@@ -5,7 +5,13 @@ import path from 'path';
 import { fileURLToPath } from 'url'; 
 import fastifyStatic from '@fastify/static'; 
 import fs from 'fs'; 
-import crypto from 'node:crypto'; // [新增] 引入 crypto 用于签名校验
+import crypto from 'node:crypto'; 
+
+// [优化] 引入压缩插件，解决 XML 传输瓶颈
+import fastifyCompress from '@fastify/compress'; 
+
+// [优化] 引入 WebDAV 处理器和缓存清除工具
+import { handleWebDavRequest, invalidateWebdavCache } from './webdav.js';
 
 // 引入核心模块
 import { addToQueue } from './queue.js';
@@ -50,10 +56,26 @@ const app = Fastify({
     bodyLimit: 50 * 1024 * 1024 // 50MB
 });
 
+// [优化] 注册压缩插件
+// 设置 threshold 为 1KB，避免压缩太小的包浪费 CPU
+app.register(fastifyCompress, {
+    global: true,
+    threshold: 1024,
+});
+
 app.register(fastifyStatic, {
     root: path.join(__dirname, '../public'),
     prefix: '/', 
     wildcard: false 
+});
+
+// [新增] WebDAV 路由
+// 必须支持 rawBody (如果需要处理 PUT，但这里是只读)
+// disableRequestLogging 防止 WebDAV 频繁的心跳检测刷屏日志
+app.all('/webdav/*', {
+    disableRequestLogging: true
+}, async (req, reply) => {
+    return handleWebDavRequest(req, reply);
 });
 
 const CALLBACK_SECRET = process.env.CALLBACK_SECRET;
@@ -89,7 +111,8 @@ app.addHook('onReady', async () => {
 
 app.addHook('onRequest', async (req, reply) => {
     const url = req.raw.url;
-    if (url.startsWith('/api/') || url === '/' || url === '/index.html' || url.includes('/assets/') || url === '/favicon.ico') return;
+    // 跳过 WebDAV 和静态资源的鉴权
+    if (url.startsWith('/api/') || url === '/' || url === '/index.html' || url.includes('/assets/') || url.startsWith('/webdav') || url === '/favicon.ico') return;
     if (AUTH_PASSWORD && url.startsWith('/api') && req.headers['authorization'] !== AUTH_PASSWORD) {}
 });
 
@@ -101,7 +124,7 @@ app.get('/api/health', async (req, reply) => {
 // 核心：无状态播放接口
 // ==========================================
 app.get('/api/play/stream', async (req, reply) => {
-    const { hash, size, name, sign } = req.query; // [修改] 获取 sign 参数
+    const { hash, size, name, sign } = req.query; 
 
     if (!hash || !size || !name) {
         logger.warn(`[Play] ❌ 参数缺失: Hash/Size/Name 必须提供`);
@@ -134,7 +157,6 @@ app.get('/api/play/stream', async (req, reply) => {
         if (!downloadUrl) throw new Error("Link generation failed");
         
         logger.info(`[Play] ✅ 获取直链成功 (无状态模式)，执行 302 跳转`);
-        // 推荐写法：URL在前，状态码在后（或者省略状态码，默认就是302）
         return reply.redirect(downloadUrl);
     } catch (e) {
         logger.error(e, `[Play] ❌ 获取直链失败`);
@@ -171,7 +193,46 @@ app.get('/api/play/:id', async (req, reply) => {
     }
 });
 
-app.get('/api/search', async (req, reply) => {
+// [优化] 4. Fastify 序列化优化
+// 为高频查询接口添加 Response Schema，加速 JSON 序列化
+app.get('/api/search', {
+    schema: {
+        querystring: {
+            type: 'object',
+            properties: {
+                q: { type: 'string' },
+                page: { type: 'integer' },
+                size: { type: 'integer' }
+            }
+        },
+        response: {
+            200: {
+                type: 'object',
+                properties: {
+                    total: { type: 'integer' },
+                    page: { type: 'integer' },
+                    size: { type: 'integer' },
+                    list: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                tmdbId: { type: 'integer' },
+                                name: { type: 'string' },
+                                year: { type: 'string' },
+                                type: { type: 'string' },
+                                genres: { type: 'string' },
+                                originalLanguage: { type: 'string', nullable: true },
+                                originCountry: { type: 'string', nullable: true },
+                                lastUpdated: { type: 'string', format: 'date-time' }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}, async (req, reply) => {
     const { q, page = 1, size = 20 } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(size);
     const take = parseInt(size);
@@ -405,6 +466,11 @@ app.post('/api/webhook/emby', async (req, reply) => {
             logger.info({ count: deletedCount }, `[Webhook] ✅ 整季已清理`);
         }
 
+        // [新增] 如果有内容被删除，清理 WebDAV 缓存
+        if (deletedCount > 0) {
+            invalidateWebdavCache();
+        }
+
         return { success: true, deletedCount };
 
     } catch (e) {
@@ -505,6 +571,7 @@ app.post('/api/admin/clear-db', async (req, reply) => {
         logger.info({ epCount: epCount.count, mainCount: mainCount.count }, '[Admin] ✅ 数据库媒体表已清空');
         
         metaCache.clear();
+        invalidateWebdavCache(); // [新增] 清空数据库时也清空 WebDAV 缓存
 
         return { 
             success: true, 
@@ -628,6 +695,9 @@ app.post('/api/admin/import', async (req, reply) => {
         }
 
         logger.info(`[Import] ✅ 导入完成，成功写入 ${count} 条记录`);
+        
+        invalidateWebdavCache(); // [新增] 导入数据后清理 WebDAV 缓存
+
         return { success: true, count };
     } catch (e) {
         logger.error(e, `[Import] 致命异常`);
@@ -718,29 +788,78 @@ app.post('/api/submit', async (req, reply) => {
             // 开启小事务
             await prisma.$transaction(async (tx) => {
                 if (isSourceTrusted) {
+                    // [优化] 3. Prisma 写入性能优化 (createMany)
                     // --- A. 可信来源 (直接入库 SeriesEpisode) ---
+                    
+                    const videosMap = new Map(); // Key: "S|E", Value: Object (用于视频去重，保留最新)
+                    const subtitlesList = [];
+                    const deleteSet = new Set(); // Set<"S|E"> (用于记录需要删除的集数)
+
+                    // 1. 内存预处理数据
                     for (const file of batchFiles) {
                         const { season, episode } = parseSeasonEpisode(file.clean_name, type);
                         const tier = file.type || 'video';
                         
-                        // 先删后加，防止重复
-                        if (tier !== 'subtitle') {
-                            await tx.seriesEpisode.deleteMany({ 
-                                where: { tmdbId, season, episode, type: { not: 'subtitle' } } 
-                            });
-                        }
-                        
-                        const newEp = await tx.seriesEpisode.create({
-                            data: {
+                        if (tier === 'subtitle') {
+                            subtitlesList.push({
                                 tmdbId, season, episode, cleanName: file.clean_name, 
                                 etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
                                 type: tier, createdAt: nowTime
+                            });
+                        } else {
+                            const key = `${season}|${episode}`;
+                            // 记录需要删除的 S|E (仅视频)
+                            deleteSet.add(key);
+                            // 记录需要插入的视频 (Map 会自动覆盖旧值，保留 batch 中最后一个)
+                            videosMap.set(key, {
+                                tmdbId, season, episode, cleanName: file.clean_name, 
+                                etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
+                                type: tier, createdAt: nowTime
+                            });
+                        }
+                    }
+
+                    // 2. 批量删除 (Delete Many)
+                    if (deleteSet.size > 0) {
+                        const orConditions = Array.from(deleteSet).map(s => {
+                            const [season, episode] = s.split('|').map(Number);
+                            return { season, episode };
+                        });
+                        
+                        await tx.seriesEpisode.deleteMany({
+                            where: {
+                                tmdbId,
+                                type: { not: 'subtitle' },
+                                OR: orConditions
                             }
                         });
-                        createdEpisodeIds.push(newEp.id);
                     }
+
+                    // 3. 批量插入 (Create Many)
+                    const toInsert = [...videosMap.values(), ...subtitlesList];
+                    if (toInsert.length > 0) {
+                        await tx.seriesEpisode.createMany({
+                            data: toInsert
+                        });
+
+                        // 4. [补救措施] 找回 IDs
+                        // createMany 不返回 ID，我们需要查回来以便生成 STRM
+                        // 使用 etag 作为临时唯一标识 (在同一个 batch 内一般唯一)
+                        const insertedEtags = toInsert.map(e => e.etag);
+                        const fetchedEpisodes = await tx.seriesEpisode.findMany({
+                            where: {
+                                tmdbId: tmdbId,
+                                etag: { in: insertedEtags }
+                            },
+                            select: { id: true }
+                        });
+                        
+                        fetchedEpisodes.forEach(ep => createdEpisodeIds.push(ep.id));
+                    }
+
                 } else {
                     // --- B. 待验证来源 (入库 PendingEpisode) ---
+                    // 不可信来源需要逐个生成 Pending 记录并获取 ID 放入 Queue，因此不使用 createMany
                     for (const file of batchFiles) {
                         const { season, episode } = parseSeasonEpisode(file.clean_name, type);
                         
@@ -807,6 +926,8 @@ app.post('/api/submit', async (req, reply) => {
             })();
         }
 
+        invalidateWebdavCache(); // [新增] 数据变动，主动清除 WebDAV 缓存
+
         return { success: true, pendingCount: isSourceTrusted ? 0 : pendingCount };
 
     } catch (e) {
@@ -829,6 +950,9 @@ app.delete('/api/delete/series', async (req, reply) => {
         prisma.seriesEpisode.deleteMany({ where: { tmdbId: id } }),
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
     ]);
+
+    invalidateWebdavCache(); // [新增] 删除后清理缓存
+
     return { success: true, id };
 });
 
@@ -840,6 +964,9 @@ app.delete('/api/delete/episode', async (req, reply) => {
         await strmService.deleteEpisode({ ...ep, series: ep.series });
         await prisma.seriesEpisode.delete({ where: { id } });
     }
+
+    invalidateWebdavCache(); // [新增] 删除后清理缓存
+
     return { success: true, id };
 });
 
@@ -904,6 +1031,9 @@ app.post('/api/webhook/upload', async (req, reply) => {
     await addToQueue({
         id: -1, cleanName: standardizedName, type: 'verify_rapid', etag, size, tmdbId, season, episode, score: newScore, sourceType: 'webhook'
     });
+
+    invalidateWebdavCache(); // [新增] Webhook 上传后清理缓存
+
     return { status: 'ok', new_name: standardizedName };
 });
 
@@ -976,8 +1106,9 @@ function parseSeasonEpisode(name, type) {
 }
 
 app.setNotFoundHandler((req, reply) => {
-    if (req.raw.url.startsWith('/api')) {
-        reply.code(404).send({ error: 'API Not Found' });
+    // 兼容 WebDAV 和 API 的 404 处理
+    if (req.raw.url.startsWith('/api') || req.raw.url.startsWith('/webdav')) {
+        reply.code(404).send({ error: 'API/WebDAV Not Found' });
     } else {
         reply.sendFile('index.html');
     }

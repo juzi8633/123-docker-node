@@ -72,7 +72,8 @@ model PendingEpisode {
   taskId      String?  @map("task_id")
   createdAt   DateTime @default(now()) @map("created_at")
   nextRetryAt BigInt   @default(0) @map("next_retry_at")
-
+  
+  @@index([etag])
   @@map("pending_episodes")
 }
 
