@@ -13,7 +13,7 @@ export const prisma = new PrismaClient();
 async function enableWalMode() {
     try {
         // 开启 WAL 模式 (允许并发读写，消除锁表阻塞)
-        await prisma.$executeRawUnsafe('PRAGMA journal_mode = WAL;');
+        await prisma.$queryRawUnsafe('PRAGMA journal_mode = WAL;');
         
         // 降低磁盘同步频率 (synchronous=NORMAL 在保证数据库损坏率极低的前提下，大幅提升写入速度)
         await prisma.$executeRawUnsafe('PRAGMA synchronous = NORMAL;');

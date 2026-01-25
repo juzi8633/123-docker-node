@@ -80,12 +80,23 @@ const CATEGORY_MAP = {
     '纪录片': { type: 'tv', genres: { contains: '99' } },
     '综艺':   { type: 'tv', genres: { contains: '10764' } },
     '儿童':   { type: 'tv', genres: { contains: '10762' } },
-    '未分类': { type: 'tv', NOT: [{ originalLanguage: 'zh' }, { originalLanguage: 'cn' }, { originalLanguage: 'en' }, { originalLanguage: 'ja' }, { originalLanguage: 'ko' }, { genres: { contains: '16' } }, { genres: { contains: '99' } }, { genres: { contains: '10764' } }, { genres: { contains: '10762' } }] }
+    // 兜底分类：防止小众剧集丢失
+    '其他剧集': { 
+        type: 'tv', 
+        NOT: [
+            { originalLanguage: 'zh' }, { originalLanguage: 'cn' },
+            { originalLanguage: 'en' },
+            { originalLanguage: 'ja' }, { originalLanguage: 'ko' },
+            { genres: { contains: '16' } }, { genres: { contains: '99' } }, 
+            { genres: { contains: '10764' } }, { genres: { contains: '10762' } }
+        ]
+    }
 };
 
 // ==========================================
 // 5. 工具函数
 // ==========================================
+
 function sanitizeName(name) {
     if (!name) return "Unknown";
     return String(name).replace(/\//g, '／').replace(/\\/g, '＼');
@@ -234,23 +245,56 @@ async function handlePropfind(req, reply, pathStr, parts) {
     if (depth !== '0') {
         // [Level 0] 根
         if (parts.length === 0) {
+            // [新增入口] 最近更新
+            appendPropXML(xmlParts, `${basePathForXml}/最近更新`, '最近更新', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
             appendPropXML(xmlParts, `${basePathForXml}/电影`, '电影', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
             appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
         }
         
-        // [Level 1] 分类
+        // [Level 1] 分类 或 最近更新
         else if (parts.length === 1) {
-            const typeFolder = parts[0]; 
-            const isMovie = typeFolder === '电影';
-            for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
-                if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
-                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(catName)}`, catName, true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
+            const folderName = parts[0]; 
+            
+            if (folderName === '最近更新') {
+                 // [核心逻辑] 使用 distinct 确保每个剧集只占一个坑位
+                 const recentEpisodes = await prisma.seriesEpisode.findMany({
+                     distinct: ['tmdbId'], // 去重
+                     take: 30,             // 只取最近更新的 30 部剧
+                     orderBy: { createdAt: 'desc' },
+                     select: { tmdbId: true }
+                 });
+ 
+                 const uniqueIds = recentEpisodes.map(f => f.tmdbId);
+ 
+                 if (uniqueIds.length > 0) {
+                     // 查剧集信息
+                     const seriesList = await prisma.seriesMain.findMany({
+                         where: { tmdbId: { in: uniqueIds } },
+                         select: { tmdbId: true, name: true, year: true, lastUpdated: true }
+                     });
+                     
+                     // 排序
+                     seriesList.sort((a, b) => uniqueIds.indexOf(a.tmdbId) - uniqueIds.indexOf(b.tmdbId));
+ 
+                     for (const s of seriesList) {
+                         const safeNameStr = sanitizeName(s.name);
+                         const folderName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
+                         appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(folderName)}`, folderName, true, 0, s.lastUpdated, getYearDate(s.year));
+                     }
+                 }
+            } else {
+                // 普通分类逻辑
+                const isMovie = folderName === '电影';
+                for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
+                    if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(catName)}`, catName, true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
+                    }
                 }
             }
         }
         
-        // [Level 2] 剧集
-        else if (parts.length === 2) {
+        // [Level 2] 剧集 (普通分类下)
+        else if (parts.length === 2 && parts[0] !== '最近更新') {
             const [typeFolder, category] = parts;
             const condition = CATEGORY_MAP[category];
             if (condition) {
@@ -262,79 +306,84 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 for (const s of seriesList) {
                     const safeNameStr = sanitizeName(s.name);
                     const folderName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
-                    // CreationDate = 剧集年份; LastMod = 数据库更新时间
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(folderName)}`, folderName, true, 0, s.lastUpdated, getYearDate(s.year));
                 }
             }
         }
         
-        // [Level 3] 季 / 电影文件
-        else if (parts.length === 3) {
-            const [typeFolder, category, seriesFolder] = parts;
-            const tmdbIdMatch = seriesFolder.match(/\{tmdb-(\d+)\}/);
-
-            if (tmdbIdMatch) {
-                const tmdbId = parseInt(tmdbIdMatch[1]);
-                const isMovie = typeFolder === '电影';
-
-                if (isMovie) {
-                    const files = await prisma.seriesEpisode.findMany({ 
-                        where: { tmdbId, type: { not: 'subtitle' } },
-                        select: { cleanName: true, size: true, createdAt: true, etag: true }
-                    });
-                    
-                    // [性能优化] 使用 Pipeline 批量写入 Redis
-                    const pipeline = redis.pipeline();
-                    for (const f of files) {
-                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
-                        pipelineCacheMeta(pipeline, f, tmdbId);
-                    }
-                    pipeline.exec().catch(e => console.error('[Redis] Pipeline Error', e)); 
-                    
-                } else {
-                    const seasons = await prisma.seriesEpisode.groupBy({
-                        by: ['season'], 
-                        where: { tmdbId, type: { not: 'subtitle' } }, 
-                        _max: { createdAt: true },
-                        _min: { createdAt: true }, 
-                        _sum: { size: true } 
-                    });
-                    seasons.sort((a, b) => a.season - b.season);
-                    for (const s of seasons) {
-                        const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
-                        const lastMod = s._max.createdAt || STATIC_FOLDER_DATE;
-                        const creation = s._min.createdAt || lastMod;
-                        const totalSize = s._sum.size || 0; 
-                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true, totalSize, lastMod, creation);
-                    }
-                }
-            }
-        }
+        // [Level 3/4 通用] 剧集详情 / 季详情
+        const lastPart = parts[parts.length - 1];
+        const prevPart = parts[parts.length - 2];
         
-        // [Level 4] 单集文件
-        else if (parts.length === 4) {
-            const [typeFolder, category, seriesFolder, seasonFolder] = parts;
-            const tmdbIdMatch = seriesFolder.match(/\{tmdb-(\d+)\}/);
-            const seasonMatch = seasonFolder.match(/Season (\d+)/);
+        const tmdbIdMatch = lastPart.match(/\{tmdb-(\d+)\}/);
+        const seasonMatch = lastPart.match(/Season (\d+)/);
+        const parentIdMatch = prevPart ? prevPart.match(/\{tmdb-(\d+)\}/) : null;
 
-            if (tmdbIdMatch && seasonMatch) {
-                const tmdbId = parseInt(tmdbIdMatch[1]);
-                const season = parseInt(seasonMatch[1]);
-                
-                const files = await prisma.seriesEpisode.findMany({
-                    where: { tmdbId, season, type: { not: 'subtitle' } }, 
-                    select: { cleanName: true, size: true, createdAt: true, etag: true },
-                    orderBy: { episode: 'asc' }
+        // [场景 A] 位于剧集根目录下 (显示文件 或 季文件夹)
+        if (tmdbIdMatch && !seasonMatch) {
+            const tmdbId = parseInt(tmdbIdMatch[1]);
+            
+            // 查季信息
+            const seasonCounts = await prisma.seriesEpisode.groupBy({
+                by: ['season'], 
+                where: { tmdbId, type: { not: 'subtitle' } }, 
+                _max: { createdAt: true },
+                _min: { createdAt: true }, 
+                _sum: { size: true } 
+            });
+
+            // 查类型判断
+            const seriesInfo = await prisma.seriesMain.findUnique({
+                where: { tmdbId },
+                select: { type: true }
+            });
+
+            if (seriesInfo?.type === 'movie') {
+                // 电影：列出所有文件
+                const files = await prisma.seriesEpisode.findMany({ 
+                    where: { tmdbId, type: { not: 'subtitle' } },
+                    select: { cleanName: true, size: true, createdAt: true, etag: true }
                 });
-
-                // [性能优化] 使用 Pipeline 批量写入 Redis
+                
                 const pipeline = redis.pipeline();
                 for (const f of files) {
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
                     pipelineCacheMeta(pipeline, f, tmdbId);
+                    // [安全策略] 已移除预热代码
                 }
-                pipeline.exec().catch(e => console.error('[Redis] Pipeline Error', e));
+                pipeline.exec().catch(() => {});
+
+            } else {
+                // 电视剧：列出所有季 (自动聚合)
+                seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
+                for (const s of seasonCounts) {
+                    const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
+                    const lastMod = s._max.createdAt || STATIC_FOLDER_DATE;
+                    const creation = s._min.createdAt || lastMod;
+                    const totalSize = s._sum.size || 0; 
+                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true, totalSize, lastMod, creation);
+                }
             }
+        }
+        
+        // [场景 B] 位于季目录下 (显示集数)
+        else if (parentIdMatch && seasonMatch) {
+            const tmdbId = parseInt(parentIdMatch[1]);
+            const season = parseInt(seasonMatch[1]);
+
+            const files = await prisma.seriesEpisode.findMany({
+                where: { tmdbId, season, type: { not: 'subtitle' } }, 
+                select: { cleanName: true, size: true, createdAt: true, etag: true },
+                orderBy: { episode: 'asc' }
+            });
+
+            const pipeline = redis.pipeline();
+            for (const f of files) {
+                appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
+                pipelineCacheMeta(pipeline, f, tmdbId);
+                // [安全策略] 已移除预热代码
+            }
+            pipeline.exec().catch(() => {});
         }
     }
 
@@ -365,13 +414,14 @@ async function handleGet(req, reply, pathStr, parts) {
     const fileName = decodeURIComponent(parts[parts.length - 1]);
     
     let tmdbId = null;
-    const pathMatch = pathStr.match(/\{tmdb-(\d+)\}/);
-    if (pathMatch) tmdbId = parseInt(pathMatch[1]);
+    // 支持从任意深度的路径中提取 TMDB ID
+    for(const part of parts) {
+        const match = part.match(/\{tmdb-(\d+)\}/);
+        if(match) { tmdbId = parseInt(match[1]); break; }
+    }
 
-    // [逻辑严密性] 拦截对目录的 GET 请求
-    // 如果没有 TMDB ID 且看起来像是目录访问，直接拒绝。
-    // 这防止了播放器把目录当文件下载，也保护了服务器资源。
     if (!tmdbId) {
+        // 如果是文件夹请求 GET，返回 403
         return reply.code(403).send('Directory listing not allowed via GET');
     }
 
@@ -402,12 +452,11 @@ async function handleGet(req, reply, pathStr, parts) {
     const headers = {
         'Content-Type': getMimeType(fileName),
         'Content-Length': String(file.size),
-        'Last-Modified': new Date(file.createdAt).toUTCString(), 
+        'Last-Modified': new Date(file.createdAt).toUTCString(),
         'ETag': `"${file.etag}"`,
         'Accept-Ranges': 'bytes'
     };
 
-    // [逻辑严密性] HEAD 请求立即返回，不进行 302
     if (req.method === 'HEAD') { reply.headers(headers); return reply.send(); }
 
     try {
