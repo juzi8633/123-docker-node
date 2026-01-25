@@ -60,6 +60,7 @@ model SeriesEpisode {
   @@index([tmdbId, season, type]) 
   @@index([tmdbId, type])
   
+  @@index([createdAt])
   // [性能优化] 文件名反查索引 (用于 handleGet)
   @@index([tmdbId, cleanName])
   @@index([tmdbId, season, episode])
