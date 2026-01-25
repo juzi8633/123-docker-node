@@ -312,78 +312,82 @@ async function handlePropfind(req, reply, pathStr, parts) {
         }
         
         // [Level 3/4 通用] 剧集详情 / 季详情
-        const lastPart = parts[parts.length - 1];
-        const prevPart = parts[parts.length - 2];
-        
-        const tmdbIdMatch = lastPart.match(/\{tmdb-(\d+)\}/);
-        const seasonMatch = lastPart.match(/Season (\d+)/);
-        const parentIdMatch = prevPart ? prevPart.match(/\{tmdb-(\d+)\}/) : null;
-
-        // [场景 A] 位于剧集根目录下 (显示文件 或 季文件夹)
-        if (tmdbIdMatch && !seasonMatch) {
-            const tmdbId = parseInt(tmdbIdMatch[1]);
+        // [修复崩溃] 必须先判断 parts 是否有内容，防止访问 root 时越界
+        if (parts.length > 0) {
+            const lastPart = parts[parts.length - 1];
+            // 只有当 parts.length >= 2 时，parts[length-2] 才是有效的，否则为 undefined (不影响逻辑但需注意)
+            const prevPart = parts.length >= 2 ? parts[parts.length - 2] : null;
             
-            // 查季信息
-            const seasonCounts = await prisma.seriesEpisode.groupBy({
-                by: ['season'], 
-                where: { tmdbId, type: { not: 'subtitle' } }, 
-                _max: { createdAt: true },
-                _min: { createdAt: true }, 
-                _sum: { size: true } 
-            });
+            const tmdbIdMatch = lastPart ? lastPart.match(/\{tmdb-(\d+)\}/) : null;
+            const seasonMatch = lastPart ? lastPart.match(/Season (\d+)/) : null;
+            const parentIdMatch = prevPart ? prevPart.match(/\{tmdb-(\d+)\}/) : null;
 
-            // 查类型判断
-            const seriesInfo = await prisma.seriesMain.findUnique({
-                where: { tmdbId },
-                select: { type: true }
-            });
-
-            if (seriesInfo?.type === 'movie') {
-                // 电影：列出所有文件
-                const files = await prisma.seriesEpisode.findMany({ 
-                    where: { tmdbId, type: { not: 'subtitle' } },
-                    select: { cleanName: true, size: true, createdAt: true, etag: true }
-                });
+            // [场景 A] 位于剧集根目录下 (显示文件 或 季文件夹)
+            if (tmdbIdMatch && !seasonMatch) {
+                const tmdbId = parseInt(tmdbIdMatch[1]);
                 
+                // 查季信息
+                const seasonCounts = await prisma.seriesEpisode.groupBy({
+                    by: ['season'], 
+                    where: { tmdbId, type: { not: 'subtitle' } }, 
+                    _max: { createdAt: true },
+                    _min: { createdAt: true }, 
+                    _sum: { size: true } 
+                });
+
+                // 查类型判断
+                const seriesInfo = await prisma.seriesMain.findUnique({
+                    where: { tmdbId },
+                    select: { type: true }
+                });
+
+                if (seriesInfo?.type === 'movie') {
+                    // 电影：列出所有文件
+                    const files = await prisma.seriesEpisode.findMany({ 
+                        where: { tmdbId, type: { not: 'subtitle' } },
+                        select: { cleanName: true, size: true, createdAt: true, etag: true }
+                    });
+                    
+                    const pipeline = redis.pipeline();
+                    for (const f of files) {
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
+                        pipelineCacheMeta(pipeline, f, tmdbId);
+                        // [已移除] 预热代码
+                    }
+                    pipeline.exec().catch(() => {});
+
+                } else {
+                    // 电视剧：列出所有季 (自动聚合)
+                    seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
+                    for (const s of seasonCounts) {
+                        const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
+                        const lastMod = s._max.createdAt || STATIC_FOLDER_DATE;
+                        const creation = s._min.createdAt || lastMod;
+                        const totalSize = s._sum.size || 0; 
+                        appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true, totalSize, lastMod, creation);
+                    }
+                }
+            }
+            
+            // [场景 B] 位于季目录下 (显示集数)
+            else if (parentIdMatch && seasonMatch) {
+                const tmdbId = parseInt(parentIdMatch[1]);
+                const season = parseInt(seasonMatch[1]);
+
+                const files = await prisma.seriesEpisode.findMany({
+                    where: { tmdbId, season, type: { not: 'subtitle' } }, 
+                    select: { cleanName: true, size: true, createdAt: true, etag: true },
+                    orderBy: { episode: 'asc' }
+                });
+
                 const pipeline = redis.pipeline();
                 for (const f of files) {
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
                     pipelineCacheMeta(pipeline, f, tmdbId);
-                    // [安全策略] 已移除预热代码
+                    // [已移除] 预热代码
                 }
                 pipeline.exec().catch(() => {});
-
-            } else {
-                // 电视剧：列出所有季 (自动聚合)
-                seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
-                for (const s of seasonCounts) {
-                    const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
-                    const lastMod = s._max.createdAt || STATIC_FOLDER_DATE;
-                    const creation = s._min.createdAt || lastMod;
-                    const totalSize = s._sum.size || 0; 
-                    appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(seasonName)}`, seasonName, true, totalSize, lastMod, creation);
-                }
             }
-        }
-        
-        // [场景 B] 位于季目录下 (显示集数)
-        else if (parentIdMatch && seasonMatch) {
-            const tmdbId = parseInt(parentIdMatch[1]);
-            const season = parseInt(seasonMatch[1]);
-
-            const files = await prisma.seriesEpisode.findMany({
-                where: { tmdbId, season, type: { not: 'subtitle' } }, 
-                select: { cleanName: true, size: true, createdAt: true, etag: true },
-                orderBy: { episode: 'asc' }
-            });
-
-            const pipeline = redis.pipeline();
-            for (const f of files) {
-                appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
-                pipelineCacheMeta(pipeline, f, tmdbId);
-                // [安全策略] 已移除预热代码
-            }
-            pipeline.exec().catch(() => {});
         }
     }
 
