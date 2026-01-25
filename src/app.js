@@ -280,9 +280,27 @@ app.get('/api/pending/list', async (req, reply) => {
     const take = parseInt(size);
     const skip = (parseInt(page) - 1) * take;
     let where = {};
-    if (filter === 'downloading') where = { OR: [{ taskId: { not: null }, NOT: { taskId: 'DONE' } }] };
-    else if (filter === 'failed') where = { retryCount: { gt: 0 }, NOT: { taskId: 'DONE' } };
-    else where = { taskId: null };
+
+    if (filter === 'downloading') {
+        where = { 
+            taskId: { not: null, notIn: ['DONE', 'QUEUED'] } 
+        };
+    } 
+    else if (filter === 'failed') {
+        where = { 
+            retryCount: { gt: 0 }, 
+            taskId: null 
+        };
+    } 
+    else { 
+        where = { 
+            OR: [
+                { taskId: null },
+                { taskId: 'QUEUED' }
+            ]
+        };
+    }
+
     try {
         const [total, list] = await prisma.$transaction([
             prisma.pendingEpisode.count({ where }),

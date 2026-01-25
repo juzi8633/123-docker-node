@@ -1,9 +1,9 @@
 // src/services/core123.js
 import redis from '../redis.js';
-import { prisma } from '../db.js'; // [新增] 引入数据库客户端
+import { prisma } from '../db.js'; 
 import dotenv from 'dotenv';
-import { setGlobalDispatcher, Agent } from 'undici'; // [优化] 引入高性能 HTTP 客户端核心
-import { LRUCache } from 'lru-cache'; // [优化] 引入 LRU 缓存库
+import { setGlobalDispatcher, Agent } from 'undici'; 
+import { LRUCache } from 'lru-cache'; 
 dotenv.config();
 
 // =========================================================================
@@ -37,6 +37,14 @@ function log(msg, data = null) {
     }
 }
 
+// [新增] 获取带偏移量的日期，格式 YYYY-MM-DD
+// offset: 0=今天, -1=昨天, -2=前天
+function getDatestamp(offset = 0) {
+    const d = new Date();
+    d.setDate(d.getDate() + offset);
+    return d.toISOString().split('T')[0];
+}
+
 // =========================================================================
 // [优化] 3. 缓存层面：使用 LRU 替代原生 Map，防止内存溢出
 // =========================================================================
@@ -67,7 +75,7 @@ export class Core123Service {
     // Redis Keys
     this.KEY_TOKEN_PREFIX = "123:token:";
     this.KEY_DLINK_PREFIX = "123:dlink:";
-    // 目录 ID 缓存前缀 (123:dir:client_id)
+    // 目录 ID 缓存前缀 (123:dir:client_id:folder_name)
     this.KEY_DIR_PREFIX = "123:dir:"; 
   }
 
@@ -233,19 +241,24 @@ export class Core123Service {
       }
   }
 
-  // === 通用：获取/创建 缓存目录 ===
+  // === [修改] 获取/创建 带日期的缓存目录 (日期隔离策略) ===
   // 每个账号（VIP或工兵）都有自己的缓存目录 ID，存入 Redis
   async getCacheDirID(account, token) {
-      const redisKey = `${this.KEY_DIR_PREFIX}${account.id}`;
+      // 1. 生成当天的目录名，例如 "123_Node_Cache_2026-01-25"
+      // 这样每天都会创建一个新目录，彻底物理隔离，防止并发冲突
+      const baseName = account.role === 'vip' ? this.VIP_CACHE_NAME : this.WORKER_CACHE_NAME;
+      const folderName = `${baseName}_${getDatestamp(0)}`; 
+      
+      // Redis Key 也带上目录名，确保唯一性: "123:dir:clientID:folderName"
+      const redisKey = `${this.KEY_DIR_PREFIX}${account.id}:${folderName}`;
+      
       const cachedId = await redis.get(redisKey);
       if (cachedId) return parseInt(cachedId);
 
-      const folderName = account.role === 'vip' ? this.VIP_CACHE_NAME : this.WORKER_CACHE_NAME;
-      // 工兵不需要整理到特定 Root 下，直接在它自己的根目录创建即可
       const parentId = account.role === 'vip' ? this.rootFolderId : 0;
 
-      // 1. 尝试创建
-      log(`[Dir] Creating/Checking folder '${folderName}' under ${parentId} for ${account.id}`); // [日志]
+      // 2. 尝试创建
+      log(`[Dir] Creating/Checking folder '${folderName}' under ${parentId} for ${account.id}`); 
 
       const createRes = await this.fetchJson(`${this.domain}/upload/v1/file/mkdir`, {
           method: "POST",
@@ -256,10 +269,11 @@ export class Core123Service {
       let dirID = 0;
       if (createRes.code === 0) {
           dirID = createRes.data.dirID;
-          log(`[Dir] Created new folder ID: ${dirID}`); // [日志]
+          log(`[Dir] Created new folder ID: ${dirID}`); 
       } else if (createRes.code === 4025 || createRes.code === 1 || createRes.message.includes("exist") || createRes.message.includes("同名")) {
-          // 已存在，反查 ID
-          log(`[Dir] Folder exists, searching ID...`); // [日志]
+          // 已存在，反查 ID (为了获取 ID 存入 Redis)
+          // 注意：这里的 list 是为了获取 ID，范围很小（精准匹配），不算全盘扫描
+          log(`[Dir] Folder exists, searching ID...`); 
           const listRes = await this.fetchJson(`${this.domain}/api/v1/file/list?parentFileId=${parentId}&page=1&limit=100`, {
               method: "GET",
               headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform }
@@ -268,26 +282,27 @@ export class Core123Service {
               const target = listRes.data.fileList.find(f => f.filename === folderName && f.type === 1);
               if (target) {
                   dirID = target.fileID;
-                  log(`[Dir] Found existing folder ID: ${dirID}`); // [日志]
+                  log(`[Dir] Found existing folder ID: ${dirID}`); 
               }
           }
       } else {
-          log(`[Dir] mkdir failed:`, createRes); // [日志]
+          log(`[Dir] mkdir failed:`, createRes); 
       }
 
       if (dirID > 0) {
-          // 存入 Redis，有效期设为 25 小时（反正每天都会删，稍微长点没事）
-          await redis.set(redisKey, String(dirID), 'EX', 90000);
+          // [关键修改] 设置 3 天 (259200秒) 过期
+          // 确保"昨天"甚至"前天"的 ID 在 Redis 里一定还在，方便清理任务精准读取
+          await redis.set(redisKey, String(dirID), 'EX', 259200);
           return dirID;
       }
-      log(`[Dir] Failed to resolve Dir ID, fallback to ParentID: ${parentId}`); // [日志]
+      log(`[Dir] Failed to resolve Dir ID, fallback to ParentID: ${parentId}`); 
       return parentId; // 降级到根目录
   }
 
-  // === [新] 每日清理逻辑 ===
-  // 遍历 VIP 和所有工兵，把他们的缓存目录移入回收站
+  // === [修改] 精准清理"昨天"的目录 (不扫描网盘，只查 Redis) ===
+  // 策略：计算出"昨天"的目录名 -> 查 Redis -> 有 ID 就删 -> 没 ID 就算了
   async recycleAllCacheFolders() {
-      console.log('🧹 [Cleanup] Starting daily cache recycling...');
+      console.log('🧹 [Cleanup] Starting targeted date cleanup...');
       
       // 每次清理前刷新一次配置，确保清理的是最新账号
       await this.reloadConfig();
@@ -299,28 +314,43 @@ export class Core123Service {
       // 去重（防止 VIP 也在 workers 里）
       const uniqueAccounts = [...new Map(accounts.map(item => [item.id, item])).values()];
 
+      // 我们清理"昨天"和"前天"的，以防万一昨天的任务失败了
+      // 这里的开销极小，只是读两次 Redis
+      const targetOffsets = [-1, -2]; 
+
       for (const acc of uniqueAccounts) {
           try {
-              const redisKey = `${this.KEY_DIR_PREFIX}${acc.id}`;
-              const dirId = await redis.get(redisKey);
-              
-              if (dirId) {
-                  const token = await this.getTokenForAccount(acc);
-                  log(`[Cleanup] Trashing folder ${dirId} for ${acc.id}...`); // [日志]
-                  // 调用移入回收站 API
-                  const res = await this.fetchJson(`${this.domain}/api/v1/file/trash`, {
-                      method: "POST",
-                      headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform, "Content-Type": "application/json" },
-                      body: JSON.stringify({ fileIds: [parseInt(dirId)] })
-                  });
+              const token = await this.getTokenForAccount(acc);
+              const baseName = acc.role === 'vip' ? this.VIP_CACHE_NAME : this.WORKER_CACHE_NAME;
+
+              for (const offset of targetOffsets) {
+                  const targetDate = getDatestamp(offset); // 获取 "2026-01-24"
+                  const targetFolderName = `${baseName}_${targetDate}`;
+                  const redisKey = `${this.KEY_DIR_PREFIX}${acc.id}:${targetFolderName}`;
                   
-                  if (res.code === 0) {
-                      console.log(`✅ [Cleanup] Recycled folder for ${acc.id}`);
-                      // 清除 Redis，下次操作会自动新建
-                      await redis.del(redisKey);
+                  // 1. 直接问 Redis：昨天那个目录 ID 是多少？
+                  const dirId = await redis.get(redisKey);
+                  
+                  if (dirId) {
+                      log(`[Cleanup] Found expired folder in Redis: ${targetFolderName} (ID: ${dirId})`);
+                      
+                      // 2. 精准删除该 ID
+                      const res = await this.fetchJson(`${this.domain}/api/v1/file/trash`, {
+                          method: "POST",
+                          headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform, "Content-Type": "application/json" },
+                          body: JSON.stringify({ fileIds: [parseInt(dirId)] })
+                      });
+
+                      if (res.code === 0 || res.code === 404) { // 成功或已不存在
+                          console.log(`✅ [Cleanup] Recycled: ${targetFolderName}`);
+                          // 3. 删除 Redis Key (任务完成)
+                          await redis.del(redisKey);
+                      } else {
+                          console.warn(`⚠️ [Cleanup] Failed to trash ${dirId}: ${res.message}`);
+                          log(`[Cleanup] Fail response:`, res); 
+                      }
                   } else {
-                      console.warn(`⚠️ [Cleanup] Failed for ${acc.id}: ${res.message}`);
-                      log(`[Cleanup] Fail response:`, res); // [日志]
+                       // Redis 里没有，说明昨天没创建或者已经清理过了，安全跳过
                   }
               }
           } catch (e) {
