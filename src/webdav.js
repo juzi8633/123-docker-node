@@ -24,10 +24,10 @@ const PREFIX_META = 'webdav:meta:';
 const TTL_REDIS_DIR = 600;      // 目录缓存 10 分钟
 const TTL_REDIS_META = 3600;    // 元数据缓存 1 小时
 
-// [L1 内存缓存]: 拦截高频并发
+// [L1 内存缓存]: 拦截高频并发 (5秒)
 const lruCache = new LRUCache({ max: 1000, ttl: 1000 * 5 });
 
-// [L0 静态缓存]: 永久驻留
+// [L0 静态缓存]: 永久驻留 (仅用于根目录和固定分类)
 const staticXmlCache = new Map();
 
 // [辅助] 解析年份
@@ -45,24 +45,37 @@ export async function invalidateWebdavCache() {
     try {
         lruCache.clear(); 
         staticXmlCache.clear();
-        // 使用 scanStream 避免阻塞 Redis
         const stream = redis.scanStream({ match: 'webdav:*', count: 100 });
         stream.on('data', (keys) => { if (keys.length) redis.unlink(keys); });
     } catch (e) { console.error(e); }
 }
 
+/**
+ * 精准缓存清除
+ * 当剧集更新/删除时调用，确保"最近更新"列表和剧集详情页实时刷新
+ */
 export async function invalidateCacheByTmdbId(tmdbId) {
     if (!tmdbId) return;
     const tmdbStr = String(tmdbId);
     try {
+        // 1. 暴力清除 L1 (内存缓存仅5秒，全清无性能影响，确保绝对实时)
         lruCache.clear();
-        // 清除元数据
+
+        // 2. 清除该剧集的文件元数据 (meta)
         const metaStream = redis.scanStream({ match: `${PREFIX_META}${tmdbStr}:*`, count: 100 });
         metaStream.on('data', (keys) => { if (keys.length) redis.unlink(keys); });
-        // 清除目录结构
+
+        // 3. 清除该剧集的目录结构缓存 (dir)
+        // 覆盖: /webdav/电视剧/分类/剧名{tmdb-xxx} 和 /webdav/最近更新/剧名{tmdb-xxx}
         const dirStream = redis.scanStream({ match: `${PREFIX_DIR}*tmdb-${tmdbStr}*`, count: 100 });
         dirStream.on('data', (keys) => { if (keys.length) redis.unlink(keys); });
-    } catch (e) { console.error(e); }
+
+        // 4. [关键] 强制清除 "最近更新" 列表页缓存
+        // 只要有任何剧集变动，"最近更新" 列表必须重算
+        const recentStream = redis.scanStream({ match: `${PREFIX_DIR}*最近更新*`, count: 100 });
+        recentStream.on('data', (keys) => { if (keys.length) redis.unlink(keys); });
+
+    } catch (e) { console.error('[WebDAV] Cache invalidation error:', e); }
 }
 
 // ==========================================
@@ -80,7 +93,6 @@ const CATEGORY_MAP = {
     '纪录片': { type: 'tv', genres: { contains: '99' } },
     '综艺':   { type: 'tv', genres: { contains: '10764' } },
     '儿童':   { type: 'tv', genres: { contains: '10762' } },
-    // 兜底分类：防止小众剧集丢失
     '其他剧集': { 
         type: 'tv', 
         NOT: [
@@ -137,7 +149,6 @@ function appendPropXML(partsArr, href, displayName, isCollection, size, lastMod,
 
     const resourceType = isCollection ? "<D:collection/>" : "";
     
-    // 大小处理：仅文件或非空文件夹显示
     let contentLength = "";
     const sizeNum = Number(size || 0); 
     if (!isCollection) {
@@ -159,9 +170,7 @@ function appendPropXML(partsArr, href, displayName, isCollection, size, lastMod,
                 <D:resourcetype>${resourceType}</D:resourcetype>
                 <D:creationdate>${creationStr}</D:creationdate>
                 <D:getlastmodified>${lastModifiedStr}</D:getlastmodified>
-                ${contentLength}
-                ${contentType}
-                ${etagNode}
+                ${contentLength} ${contentType} ${etagNode}
                 <D:Win32FileAttributes>${fileAttributes}</D:Win32FileAttributes>
             </D:prop>
             <D:status>HTTP/1.1 200 OK</D:status>
@@ -169,11 +178,9 @@ function appendPropXML(partsArr, href, displayName, isCollection, size, lastMod,
     </D:response>`);
 }
 
-// [性能优化] 使用 Pipeline 批量缓存元数据
 function pipelineCacheMeta(pipeline, f, tmdbId) {
     const key = `${PREFIX_META}${tmdbId}:${f.cleanName}`;
     const data = { cleanName: f.cleanName, etag: f.etag, size: String(f.size), createdAt: f.createdAt };
-    // 使用 pipeline.set 而不是 redis.set
     pipeline.set(key, JSON.stringify(data), 'EX', TTL_REDIS_META);
 }
 
@@ -201,7 +208,7 @@ export async function handleWebDavRequest(req, reply) {
         switch (method) {
             case 'PROPFIND': return await handlePropfind(req, reply, urlPath, parts);
             case 'GET': return await handleGet(req, reply, urlPath, parts);
-            case 'HEAD': return await handleGet(req, reply, urlPath, parts); // 统一处理
+            case 'HEAD': return await handleGet(req, reply, urlPath, parts);
             case 'OPTIONS':
                 reply.header('DAV', '1, 2');
                 reply.header('Allow', 'OPTIONS, GET, HEAD, PROPFIND, PROPPATCH, LOCK, UNLOCK');
@@ -225,7 +232,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     const cacheKey = `${PREFIX_DIR}${pathStr}:${depth}`;
     
-    // 缓存层级检查
+    // 缓存命中检查
     if (lruCache.has(cacheKey)) return serveCache(reply, req, lruCache.get(cacheKey));
     if (staticXmlCache.has(cacheKey)) return serveCache(reply, req, staticXmlCache.get(cacheKey));
     const cachedXml = await redis.get(cacheKey);
@@ -239,27 +246,26 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const basePathForXml = `/webdav${encodedPathStr ? '/' + encodedPathStr : ''}`;
     const selfName = parts.length > 0 ? parts[parts.length - 1] : '/';
     
-    // 添加自身节点
+    // 添加当前目录自身节点
     appendPropXML(xmlParts, basePathForXml, selfName, true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
 
     if (depth !== '0') {
-        // [Level 0] 根
+        // [Level 0] 根目录
         if (parts.length === 0) {
-            // [新增入口] 最近更新
             appendPropXML(xmlParts, `${basePathForXml}/最近更新`, '最近更新', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
             appendPropXML(xmlParts, `${basePathForXml}/电影`, '电影', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
             appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
         }
         
-        // [Level 1] 分类 或 最近更新
+        // [Level 1]
         else if (parts.length === 1) {
             const folderName = parts[0]; 
             
             if (folderName === '最近更新') {
-                 // [核心逻辑] 使用 distinct 确保每个剧集只占一个坑位
+                 // [动态逻辑] 查找最近入库的30部剧集
                  const recentEpisodes = await prisma.seriesEpisode.findMany({
-                     distinct: ['tmdbId'], // 去重
-                     take: 30,             // 只取最近更新的 30 部剧
+                     distinct: ['tmdbId'], 
+                     take: 30,             
                      orderBy: { createdAt: 'desc' },
                      select: { tmdbId: true }
                  });
@@ -267,13 +273,11 @@ async function handlePropfind(req, reply, pathStr, parts) {
                  const uniqueIds = recentEpisodes.map(f => f.tmdbId);
  
                  if (uniqueIds.length > 0) {
-                     // 查剧集信息
                      const seriesList = await prisma.seriesMain.findMany({
                          where: { tmdbId: { in: uniqueIds } },
                          select: { tmdbId: true, name: true, year: true, lastUpdated: true }
                      });
                      
-                     // 排序
                      seriesList.sort((a, b) => uniqueIds.indexOf(a.tmdbId) - uniqueIds.indexOf(b.tmdbId));
  
                      for (const s of seriesList) {
@@ -283,7 +287,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
                      }
                  }
             } else {
-                // 普通分类逻辑
+                // [静态逻辑] 普通分类
                 const isMovie = folderName === '电影';
                 for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
                     if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
@@ -293,7 +297,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
             }
         }
         
-        // [Level 2] 剧集 (普通分类下)
+        // [Level 2] 普通分类下的剧集列表
         else if (parts.length === 2 && parts[0] !== '最近更新') {
             const [typeFolder, category] = parts;
             const condition = CATEGORY_MAP[category];
@@ -311,22 +315,19 @@ async function handlePropfind(req, reply, pathStr, parts) {
             }
         }
         
-        // [Level 3/4 通用] 剧集详情 / 季详情
-        // [修复崩溃] 必须先判断 parts 是否有内容，防止访问 root 时越界
+        // [Level 3/4] 剧集详情/季详情 (通用路径自适应)
         if (parts.length > 0) {
             const lastPart = parts[parts.length - 1];
-            // 只有当 parts.length >= 2 时，parts[length-2] 才是有效的，否则为 undefined (不影响逻辑但需注意)
             const prevPart = parts.length >= 2 ? parts[parts.length - 2] : null;
             
             const tmdbIdMatch = lastPart ? lastPart.match(/\{tmdb-(\d+)\}/) : null;
             const seasonMatch = lastPart ? lastPart.match(/Season (\d+)/) : null;
             const parentIdMatch = prevPart ? prevPart.match(/\{tmdb-(\d+)\}/) : null;
 
-            // [场景 A] 位于剧集根目录下 (显示文件 或 季文件夹)
+            // [场景 A] 剧集根目录
             if (tmdbIdMatch && !seasonMatch) {
                 const tmdbId = parseInt(tmdbIdMatch[1]);
                 
-                // 查季信息
                 const seasonCounts = await prisma.seriesEpisode.groupBy({
                     by: ['season'], 
                     where: { tmdbId, type: { not: 'subtitle' } }, 
@@ -335,14 +336,12 @@ async function handlePropfind(req, reply, pathStr, parts) {
                     _sum: { size: true } 
                 });
 
-                // 查类型判断
                 const seriesInfo = await prisma.seriesMain.findUnique({
                     where: { tmdbId },
                     select: { type: true }
                 });
 
                 if (seriesInfo?.type === 'movie') {
-                    // 电影：列出所有文件
                     const files = await prisma.seriesEpisode.findMany({ 
                         where: { tmdbId, type: { not: 'subtitle' } },
                         select: { cleanName: true, size: true, createdAt: true, etag: true }
@@ -352,12 +351,9 @@ async function handlePropfind(req, reply, pathStr, parts) {
                     for (const f of files) {
                         appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
                         pipelineCacheMeta(pipeline, f, tmdbId);
-                        // [已移除] 预热代码
                     }
                     pipeline.exec().catch(() => {});
-
                 } else {
-                    // 电视剧：列出所有季 (自动聚合)
                     seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
                     for (const s of seasonCounts) {
                         const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
@@ -369,7 +365,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 }
             }
             
-            // [场景 B] 位于季目录下 (显示集数)
+            // [场景 B] 季目录
             else if (parentIdMatch && seasonMatch) {
                 const tmdbId = parseInt(parentIdMatch[1]);
                 const season = parseInt(seasonMatch[1]);
@@ -384,7 +380,6 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 for (const f of files) {
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
                     pipelineCacheMeta(pipeline, f, tmdbId);
-                    // [已移除] 预热代码
                 }
                 pipeline.exec().catch(() => {});
             }
@@ -393,10 +388,15 @@ async function handlePropfind(req, reply, pathStr, parts) {
 
     const finalXml = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${xmlParts.join('')}</D:multistatus>`;
     
-    // 写入响应缓存
-    if (parts.length <= 1 && depth !== '0') {
+    // [🔥 关键修复] 缓存决策逻辑
+    // 1. "最近更新" 目录 (Level 1) 必须走 Redis，不能走 StaticCache
+    const isRecentUpdates = parts.length === 1 && parts[0] === '最近更新';
+    
+    // 2. 只有根目录(/) 和 固定分类目录 进 Static Cache
+    if (parts.length <= 1 && depth !== '0' && !isRecentUpdates) {
         staticXmlCache.set(cacheKey, finalXml);
     } else {
+        // "最近更新" 和所有详情页 走 Redis
         await redis.set(cacheKey, finalXml, 'EX', TTL_REDIS_DIR);
         lruCache.set(cacheKey, finalXml);
     }
@@ -418,16 +418,12 @@ async function handleGet(req, reply, pathStr, parts) {
     const fileName = decodeURIComponent(parts[parts.length - 1]);
     
     let tmdbId = null;
-    // 支持从任意深度的路径中提取 TMDB ID
     for(const part of parts) {
         const match = part.match(/\{tmdb-(\d+)\}/);
         if(match) { tmdbId = parseInt(match[1]); break; }
     }
 
-    if (!tmdbId) {
-        // 如果是文件夹请求 GET，返回 403
-        return reply.code(403).send('Directory listing not allowed via GET');
-    }
+    if (!tmdbId) return reply.code(403).send('Directory listing not allowed via GET');
 
     const cacheKey = `${PREFIX_META}${tmdbId}:${fileName}`;
     let file = lruCache.get(cacheKey);
@@ -466,7 +462,6 @@ async function handleGet(req, reply, pathStr, parts) {
     try {
         const downloadUrl = await core123.getDownloadUrlByHash(file.cleanName, file.etag, Number(file.size));
         if (!downloadUrl) throw new Error('Link generation failed');
-        // req.log.info({ file: fileName }, `[WebDAV] Redirect -> Stream`);
         return reply.redirect(downloadUrl);
     } catch (e) {
         req.log.error(e, `[WebDAV] Link Error: ${fileName}`);
