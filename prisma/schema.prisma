@@ -64,12 +64,10 @@ model SeriesEpisode {
   // [性能优化] 文件名反查索引 (用于 handleGet)
   @@index([tmdbId, cleanName])
   @@index([tmdbId, season, episode])
-  // 必须有！否则 groupBy 会非常慢
-  @@index([createdAt]) 
 
   // 如果想要极致性能，可以使用复合索引覆盖查询
   @@index([tmdbId, createdAt])
-  
+
   @@map("series_episodes")
 }
 
