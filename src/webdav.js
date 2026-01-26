@@ -250,18 +250,18 @@ async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     const cacheKey = `${PREFIX_DIR}${pathStr}:${depth}`;
     
-    // [性能优化] 缓存直接返回 Object {xml, etag}，避免重复计算 ETag
+    // [性能优化] 缓存检查：直接获取预计算好的 CacheObject { xml, etag }
     if (lruCache.has(cacheKey)) return serveCacheObject(reply, req, lruCache.get(cacheKey));
     if (staticXmlCache.has(cacheKey)) return serveCacheObject(reply, req, staticXmlCache.get(cacheKey));
     
     const cachedStr = await redis.get(cacheKey);
     if (cachedStr) {
         try {
-            const cacheObj = JSON.parse(cachedStr); // Redis 存的是 JSON
+            const cacheObj = JSON.parse(cachedStr); // Redis 存的是 JSON 字符串
             lruCache.set(cacheKey, cacheObj);
             return serveCacheObject(reply, req, cacheObj);
         } catch(e) {
-            // 兼容旧数据
+            // 兼容旧版缓存（纯 XML 字符串）
             const oldObj = { xml: cachedStr, etag: calculateETag(cachedStr) };
             return serveCacheObject(reply, req, oldObj);
         }
@@ -282,25 +282,33 @@ async function handlePropfind(req, reply, pathStr, parts) {
             appendPropXML(xmlParts, `${basePathForXml}/电视剧`, '电视剧', true, 0, STATIC_FOLDER_DATE, STATIC_FOLDER_DATE);
         }
         
-        // [Level 1] 分类 or 最近更新
+        // [Level 1] 分类 或 最近更新
         else if (parts.length === 1) {
             const folderName = parts[0]; 
             
             if (folderName === '最近更新') {
-                 // [动态] 30条去重
-                 const recentEpisodes = await prisma.seriesEpisode.findMany({
-                     distinct: ['tmdbId'], 
-                     take: 30,             
-                     orderBy: { createdAt: 'desc' },
-                     select: { tmdbId: true }
+                 // [⚡️ 核心修复] 使用 groupBy 解决霸屏问题
+                 // 逻辑：按 tmdbId 分组 -> 找出每组最大 createdAt -> 按这个时间倒序 -> 取前30个组
+                 const recentGroups = await prisma.seriesEpisode.groupBy({
+                     by: ['tmdbId'],
+                     _max: { createdAt: true },
+                     orderBy: {
+                         _max: { createdAt: 'desc' }
+                     },
+                     take: 30
                  });
-                 const uniqueIds = recentEpisodes.map(f => f.tmdbId);
+ 
+                 const uniqueIds = recentGroups.map(g => g.tmdbId);
+ 
                  if (uniqueIds.length > 0) {
                      const seriesList = await prisma.seriesMain.findMany({
                          where: { tmdbId: { in: uniqueIds } },
                          select: { tmdbId: true, name: true, year: true, lastUpdated: true }
                      });
+                     
+                     // 按照 uniqueIds 的顺序对结果进行排序
                      seriesList.sort((a, b) => uniqueIds.indexOf(a.tmdbId) - uniqueIds.indexOf(b.tmdbId));
+ 
                      for (const s of seriesList) {
                          const safeNameStr = sanitizeName(s.name);
                          const folderName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
@@ -308,7 +316,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
                      }
                  }
             } else {
-                // [静态] 分类
+                // [静态逻辑] 普通分类
                 const isMovie = folderName === '电影';
                 for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
                     if ((isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv')) {
@@ -336,7 +344,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
             }
         }
         
-        // [Level 3/4] 剧集详情 (通用路径)
+        // [Level 3/4] 剧集详情/季详情 (通用路径自适应)
         // [健壮性修复] 必须检查 parts.length > 0 防止根目录越界
         if (parts.length > 0) {
             const lastPart = parts[parts.length - 1];
@@ -349,23 +357,33 @@ async function handlePropfind(req, reply, pathStr, parts) {
             // [场景 A] 剧集根目录
             if (tmdbIdMatch && !seasonMatch) {
                 const tmdbId = parseInt(tmdbIdMatch[1]);
+                
                 const seasonCounts = await prisma.seriesEpisode.groupBy({
-                    by: ['season'], where: { tmdbId, type: { not: 'subtitle' } }, 
-                    _max: { createdAt: true }, _min: { createdAt: true }, _sum: { size: true } 
+                    by: ['season'], 
+                    where: { tmdbId, type: { not: 'subtitle' } }, 
+                    _max: { createdAt: true },
+                    _min: { createdAt: true }, 
+                    _sum: { size: true } 
                 });
-                const seriesInfo = await prisma.seriesMain.findUnique({ where: { tmdbId }, select: { type: true } });
+
+                const seriesInfo = await prisma.seriesMain.findUnique({
+                    where: { tmdbId },
+                    select: { type: true }
+                });
 
                 if (seriesInfo?.type === 'movie') {
                     const files = await prisma.seriesEpisode.findMany({ 
                         where: { tmdbId, type: { not: 'subtitle' } },
                         select: { cleanName: true, size: true, createdAt: true, etag: true }
                     });
+                    
                     const pipeline = redis.pipeline();
                     for (const f of files) {
                         appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
                         pipelineCacheMeta(pipeline, f, tmdbId);
                     }
                     pipeline.exec().catch(() => {});
+
                 } else {
                     seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
                     for (const s of seasonCounts) {
@@ -382,11 +400,13 @@ async function handlePropfind(req, reply, pathStr, parts) {
             else if (parentIdMatch && seasonMatch) {
                 const tmdbId = parseInt(parentIdMatch[1]);
                 const season = parseInt(seasonMatch[1]);
+
                 const files = await prisma.seriesEpisode.findMany({
                     where: { tmdbId, season, type: { not: 'subtitle' } }, 
                     select: { cleanName: true, size: true, createdAt: true, etag: true },
                     orderBy: { episode: 'asc' }
                 });
+
                 const pipeline = redis.pipeline();
                 for (const f of files) {
                     appendPropXML(xmlParts, `${basePathForXml}/${encodeURIComponent(f.cleanName)}`, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
@@ -399,15 +419,19 @@ async function handlePropfind(req, reply, pathStr, parts) {
 
     const finalXml = `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${xmlParts.join('')}</D:multistatus>`;
     
-    // [关键修复] 缓存决策逻辑
-    const cacheObject = { xml: finalXml, etag: calculateETag(finalXml) };
+    // [性能优化] 预计算 ETag 并作为对象存储
+    const cacheObject = {
+        xml: finalXml,
+        etag: calculateETag(finalXml)
+    };
+
     const isRecentUpdates = parts.length === 1 && parts[0] === '最近更新';
     
-    // 1. 静态目录 -> 内存 Map
+    // 1. 只有根目录(/) 和 固定分类目录(Level 1) 进 Static Cache
     if (parts.length <= 1 && depth !== '0' && !isRecentUpdates) {
         staticXmlCache.set(cacheKey, cacheObject);
     } else {
-        // 2. 动态目录(最近更新, 详情页) -> Redis
+        // 2. "最近更新" 和所有详情页 走 Redis
         await redis.set(cacheKey, JSON.stringify(cacheObject), 'EX', TTL_REDIS_DIR);
         lruCache.set(cacheKey, cacheObject);
     }
@@ -416,7 +440,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
 }
 
 function serveCacheObject(reply, req, cacheObj) {
-    if (typeof cacheObj === 'string') { // 兼容旧缓存
+    if (typeof cacheObj === 'string') {
         const etag = calculateETag(cacheObj);
         reply.header('ETag', etag);
         if (req.headers['if-none-match'] === etag) return reply.code(304).send();
