@@ -145,7 +145,7 @@ const worker = new Worker('download-queue', async (job) => {
     // B. 秒传失败 -> 离线下载 (Fallback)
     logger.warn({ taskName }, `⚠️ 秒传失败，准备离线下载`);
 
-    if (task.sourceType === 'quark' && task.sourceType === '115') {
+    if (task.sourceType === 'quark' || task.sourceType === '115') {
         throw new Error("夸克和115不支持离线下载");
     }
 
@@ -216,7 +216,7 @@ export const addToQueue = async (taskData) => {
   logger.info({ cleanName: taskData.cleanName, type: taskData.sourceType }, `[Producer] Adding to queue`);
   await downloadQueue.add('process', taskData, {
     removeOnComplete: true,
-    attempts: taskData.sourceType === 'quark' ? 1 : 5,
+    attempts: 1,
     backoff: { type: 'exponential', delay: 2000 }
   });
 };
