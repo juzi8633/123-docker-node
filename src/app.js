@@ -1,3 +1,4 @@
+// src/app.js
 import Fastify from 'fastify';
 import dotenv from 'dotenv';
 import { Readable } from 'stream';
@@ -18,16 +19,13 @@ import { addToQueue } from './queue.js';
 import { prisma } from './db.js'; 
 import redis from './redis.js';
 import { core123 } from './services/core123.js';
-import { strmService } from './services/strm.js'; 
 import { createLogger } from './logger.js'; 
 
-// 引入管理脚本逻辑
-import { runSyncStrm } from '../scripts/sync_strm.js';
-import { runVerifyStrm } from '../scripts/verify_strm.js';
 
 import { create123RapidTransfer } from "./services/service123.js";
 import { create189RapidTransfer } from "./services/service189.js";
 import { createQuarkRapidTransfer } from "./services/serviceQuark.js";
+import { create115RapidTransfer } from "./services/service115.js"; // [新增] 引入 115 服务
 
 import { 
     analyzeName, 
@@ -57,9 +55,7 @@ const app = Fastify({
 });
 
 // [修复 415 错误] 注册 XML 解析器以支持 WebDAV
-// WebDAV 客户端会发送 application/xml 请求，我们需要允许通过
 app.addContentTypeParser(['application/xml', 'text/xml'], (req, payload, done) => {
-    // 我们不需要解析 XML 内容（WebDAV 是只读的），直接读取为字符串防止请求挂起
     let data = '';
     payload.on('data', chunk => { data += chunk; });
     payload.on('end', () => {
@@ -68,7 +64,6 @@ app.addContentTypeParser(['application/xml', 'text/xml'], (req, payload, done) =
 });
 
 // [优化] 注册压缩插件
-// 设置 threshold 为 1KB，避免压缩太小的包浪费 CPU
 app.register(fastifyCompress, {
     global: true,
     threshold: 1024,
@@ -81,19 +76,15 @@ app.register(fastifyStatic, {
 });
 
 // [新增] WebDAV 路由
-// 必须支持 rawBody (如果需要处理 PUT，但这里是只读)
-// disableRequestLogging 防止 WebDAV 频繁的心跳检测刷屏日志
 app.all('/webdav/*', {
     disableRequestLogging: true
 }, async (req, reply) => {
     return handleWebDavRequest(req, reply);
 });
 
-const CALLBACK_SECRET = process.env.CALLBACK_SECRET;
-const AUTH_PASSWORD = process.env.AUTH_PASSWORD;
+const SECRET = process.env.SECRET;
 
 const metaCache = new Map();
-let isMaintenanceRunning = false;
 
 app.addHook('onReady', async () => {
     try {
@@ -110,7 +101,6 @@ app.addHook('onReady', async () => {
         }
 
         await core123.initLinkCacheFolder();
-        await strmService.init(); 
 
         app.log.info('✅ [System] Redis & SQLite 连接成功');
         logger.info('系统启动完成');
@@ -122,13 +112,12 @@ app.addHook('onReady', async () => {
 
 app.addHook('onRequest', async (req, reply) => {
     const url = req.raw.url;
-    // 跳过 WebDAV 和静态资源的鉴权
-    if (url.startsWith('/api/') || url === '/' || url === '/index.html' || url.includes('/assets/') || url.startsWith('/webdav') || url === '/favicon.ico') return;
-    if (AUTH_PASSWORD && url.startsWith('/api') && req.headers['authorization'] !== AUTH_PASSWORD) {}
+    if (url.startsWith('/api/webhook/upload') || url.startsWith('/api/webhook/emby') || url === '/' || url === '/index.html' || url.includes('/assets/') || url.startsWith('/webdav') || url === '/favicon.ico') return;
+    if (SECRET && url.startsWith('/api') && req.headers['authorization'] !== SECRET) {}
 });
 
 app.get('/api/health', async (req, reply) => {
-    return { status: 'running', service: '123-Node-Server (Strm Mode)' };
+    return { status: 'running', service: '123-Node-Server (Multi-Pan Mode)' };
 });
 
 // ==========================================
@@ -142,19 +131,14 @@ app.get('/api/play/stream', async (req, reply) => {
         return reply.code(400).send("Missing hash, size or name params");
     }
 
-    // =========================================================
-    // [新增] 安全校验逻辑：HMAC 签名验证
-    // =========================================================
-    const secret = process.env.SECURITY_KEY || process.env.CALLBACK_SECRET || 'default_secret_key';
+    const secret = process.env.SECRET;
     const signStr = `${hash}|${size}`;
     const expectedSign = crypto.createHmac('sha256', secret).update(signStr).digest('hex');
 
-    // 校验签名是否匹配 (防止篡改或盗链)
     if (!sign || sign !== expectedSign) {
         logger.warn({ ip: req.ip, name, querySign: sign }, `[Security] ⛔ 签名校验失败，拒绝非法播放请求`);
         return reply.code(403).send("Forbidden: Invalid Signature");
     }
-    // =========================================================
 
     logger.info({ hash, size, name }, `[Play] 收到无状态播放请求: ${name}`);
 
@@ -204,7 +188,6 @@ app.get('/api/play/:id', async (req, reply) => {
     }
 });
 
-// [优化] 4. Fastify 序列化优化
 // 为高频查询接口添加 Response Schema，加速 JSON 序列化
 app.get('/api/search', {
     schema: {
@@ -371,10 +354,6 @@ app.post('/api/config', async (req, reply) => {
             await core123.reloadConfig();
             logger.info('[Config] Core123 服务已热重载');
         }
-        
-        if (strmService.reloadConfig) {
-            await strmService.reloadConfig();
-        }
 
         metaCache.clear();
         return { success: true };
@@ -384,179 +363,6 @@ app.post('/api/config', async (req, reply) => {
     }
 });
 
-// ==========================================
-// [新增] Emby Webhook 接口 (删除同步)
-// ==========================================
-app.post('/api/webhook/emby', async (req, reply) => {
-    const { secret } = req.query;
-    const payload = req.body;
-
-    if (secret !== CALLBACK_SECRET) {
-        logger.warn({ ip: req.ip }, '[Webhook] ❌ Emby 回调密钥错误，拒绝访问');
-        return reply.code(403).send('Forbidden: Invalid Secret');
-    }
-
-    if (!payload || !payload.Event) {
-        logger.warn('[Webhook] 收到空 Payload 或缺失 Event 字段');
-        return { status: 'ignored', reason: 'invalid_payload' };
-    }
-
-    logger.info({ event: payload.Event, itemType: payload.Item?.Type, itemName: payload.Item?.Name }, `[Webhook] 收到 Emby 事件通知`);
-    
-    // logger.debug({ payload }, '[Webhook] Full Payload');
-
-    if (payload.Event !== 'item.deleted') {
-        return { status: 'ignored', reason: `event_${payload.Event}_not_handled` };
-    }
-
-    const item = payload.Item;
-    if (!item) return { status: 'ignored', reason: 'no_item_data' };
-
-    const type = item.Type;
-    const tmdbIdStr = item.ProviderIds?.Tmdb; 
-    
-    if (!tmdbIdStr) {
-        logger.warn({ itemName: item.Name }, '[Webhook] ⚠️ 无法获取 TMDB ID，跳过处理');
-        return { status: 'skipped', reason: 'missing_tmdb_id' };
-    }
-    const tmdbId = parseInt(tmdbIdStr);
-
-    try {
-        let deletedCount = 0;
-
-        // --- 情况 A: 删除整部剧 (Series) 或 电影 (Movie) ---
-        if (type === 'Series' || type === 'Movie') {
-            logger.info({ tmdbId, type }, `[Webhook] 正在删除整部作品...`);
-            
-            const episodes = await prisma.seriesEpisode.findMany({
-                where: { tmdbId },
-                include: { series: true } 
-            });
-
-            for (const ep of episodes) {
-                await strmService.deleteEpisode(ep);
-            }
-
-            const delRes = await prisma.seriesMain.deleteMany({ where: { tmdbId } });
-            deletedCount = delRes.count;
-            
-            logger.info({ title: item.Name, count: deletedCount }, `[Webhook] ✅ 整部作品已彻底清理`);
-        } 
-        
-        // --- 情况 B: 删除单集 (Episode) ---
-        else if (type === 'Episode') {
-            const seasonNum = item.ParentIndexNumber; 
-            const episodeNum = item.IndexNumber; 
-
-            if (seasonNum === undefined || episodeNum === undefined) {
-                logger.warn('[Webhook] 单集缺失 S/E 信息，无法定位');
-                return { status: 'failed', reason: 'missing_index' };
-            }
-
-            logger.info({ tmdbId, S: seasonNum, E: episodeNum }, `[Webhook] 正在删除单集...`);
-
-            const ep = await prisma.seriesEpisode.findFirst({
-                where: { 
-                    tmdbId: tmdbId, 
-                    season: seasonNum, 
-                    episode: episodeNum,
-                    type: { not: 'subtitle' } 
-                },
-                include: { series: true }
-            });
-
-            if (ep) {
-                await strmService.deleteEpisode(ep);
-                await prisma.seriesEpisode.delete({ where: { id: ep.id } });
-                deletedCount = 1;
-                logger.info({ file: ep.cleanName }, `[Webhook] ✅ 单集已删除`);
-            } else {
-                logger.warn(`[Webhook] 数据库未找到对应单集 (Tmdb:${tmdbId} S${seasonNum}E${episodeNum})`);
-            }
-        }
-
-        // --- 情况 C: 删除整季 (Season) ---
-        else if (type === 'Season') {
-            const seasonNum = item.IndexNumber; 
-            if (seasonNum === undefined) return { status: 'failed', reason: 'missing_season_index' };
-
-            logger.info({ tmdbId, Season: seasonNum }, `[Webhook] 正在删除整季...`);
-
-            const seasonEps = await prisma.seriesEpisode.findMany({
-                where: { tmdbId, season: seasonNum },
-                include: { series: true }
-            });
-
-            for (const ep of seasonEps) {
-                await strmService.deleteEpisode(ep);
-                await prisma.seriesEpisode.delete({ where: { id: ep.id } });
-                deletedCount++;
-            }
-            logger.info({ count: deletedCount }, `[Webhook] ✅ 整季已清理`);
-        }
-
-        // [修改] 如果有内容被删除，精准清理 WebDAV 缓存
-        if (deletedCount > 0 && tmdbId) {
-            await invalidateCacheByTmdbId(tmdbId);
-        } else if (deletedCount > 0) {
-            invalidateWebdavCache(); // 兜底
-        }
-
-        return { success: true, deletedCount };
-
-    } catch (e) {
-        logger.error(e, `[Webhook] 处理删除事件失败`);
-        return reply.code(500).send({ error: e.message });
-    }
-});
-
-app.post('/api/admin/strm-replace', async (req, reply) => {
-    const { find, replace } = req.body;
-    if (!find) return reply.code(400).send({ error: "查找内容不能为空" });
-
-    logger.info({ find, replace }, '[Maintenance] 开始全量替换 STRM 内容...');
-    const STRM_ROOT = process.env.STRM_ROOT || path.join(process.cwd(), 'strm');
-    
-    let scanned = 0;
-    let replaced = 0;
-
-    async function walkAndReplace(dir) {
-        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-        for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-                await walkAndReplace(fullPath);
-            } else if (entry.name.endsWith('.strm')) {
-                scanned++;
-                // [核心修复] 每 500 个文件打印一次进度，解决控制台无反馈的问题
-                if (scanned % 500 === 0) {
-                    logger.info({ scanned, replaced }, `[Maintenance] 🔄 正在扫描进度...`);
-                }
-
-                try {
-                    const content = await fs.promises.readFile(fullPath, 'utf8');
-                    if (content.includes(find)) {
-                        const newContent = content.split(find).join(replace || '');
-                        await fs.promises.writeFile(fullPath, newContent, 'utf8');
-                        replaced++;
-                    }
-                } catch (readErr) {
-                    logger.warn({ file: entry.name, msg: readErr.message }, '[Maintenance] 文件读写失败');
-                }
-            }
-        }
-    }
-
-    try {
-        await walkAndReplace(STRM_ROOT);
-        logger.info({ scanned, replaced }, '[Maintenance] STRM 内容替换完成');
-        strmService.triggerScan().catch(() => {});
-        return { success: true, stats: { scanned, replaced } };
-    } catch (e) {
-        logger.error(e, '[Maintenance] 替换过程出错');
-        return reply.code(500).send({ error: e.message });
-    }
-});
 
 app.get('/api/offline/progress', async (req, reply) => {
     const taskID = req.query.taskID;
@@ -570,27 +376,6 @@ app.get('/api/offline/progress', async (req, reply) => {
     } catch(e) { return { code: 1, message: e.message }; }
 });
 
-app.post('/api/admin/sync', async (req, reply) => {
-    if (isMaintenanceRunning) return reply.code(409).send({ error: "Another task is already running" });
-    isMaintenanceRunning = true;
-    
-    const { overwriteStrm, overwriteSub, skipSub } = req.body;
-    
-    try {
-        const result = await runSyncStrm({ overwriteStrm, overwriteSub, skipSub });
-        return { status: 'ok', data: result };
-    } catch (e) { return reply.code(500).send({ error: e.message }); } finally { isMaintenanceRunning = false; }
-});
-
-app.post('/api/admin/verify', async (req, reply) => {
-    if (isMaintenanceRunning) return reply.code(409).send({ error: "Another task is already running" });
-    isMaintenanceRunning = true;
-    try {
-        const result = await runVerifyStrm();
-        return { status: 'ok', data: result };
-    } catch (e) { return reply.code(500).send({ error: e.message }); } finally { isMaintenanceRunning = false; }
-});
-
 app.post('/api/admin/clear-db', async (req, reply) => {
     logger.warn('[Admin] ⚠️ 收到清空媒体库请求 (Clear DB)...');
     try {
@@ -602,11 +387,11 @@ app.post('/api/admin/clear-db', async (req, reply) => {
         logger.info({ epCount: epCount.count, mainCount: mainCount.count }, '[Admin] ✅ 数据库媒体表已清空');
         
         metaCache.clear();
-        invalidateWebdavCache(); // [新增] 清空数据库时也清空 WebDAV 缓存
+        invalidateWebdavCache(); 
 
         return { 
             success: true, 
-            message: "Library tables cleared. Please run 'Verify' to clean up physical files.",
+            message: "Library tables cleared.",
             stats: { 
                 episodesDeleted: epCount.count, 
                 seriesDeleted: mainCount.count 
@@ -727,7 +512,7 @@ app.post('/api/admin/import', async (req, reply) => {
 
         logger.info(`[Import] ✅ 导入完成，成功写入 ${count} 条记录`);
         
-        invalidateWebdavCache(); // [新增] 导入数据后清理 WebDAV 缓存
+        invalidateWebdavCache(); 
 
         return { success: true, count };
     } catch (e) {
@@ -762,15 +547,13 @@ async function handleMetadataMigration(newData, reqLogger) {
     if (!oldSeries) return false;
     const isChanged = oldSeries.name !== name || oldSeries.year !== year || oldSeries.originalLanguage !== originalLanguage || oldSeries.originCountry !== originCountry || oldSeries.genres !== genres;
     if (isChanged) {
-        logger.info({ tmdbId }, `[Migration] 元数据变更，清理旧 STRM...`);
-        for (const ep of oldSeries.episodes) await strmService.deleteEpisode({ ...ep, series: oldSeries });
+        logger.info({ tmdbId }, `[Migration] 元数据变更`);
         return true; 
     }
     return false;
 }
 
 app.post('/api/submit', async (req, reply) => {
-    // 1. 解构参数，设置默认值
     const { 
         tmdbId, jsonData, seriesName, seriesYear, 
         type = 'tv', genres = '', sourceType = '123', 
@@ -779,20 +562,16 @@ app.post('/api/submit', async (req, reply) => {
 
     const isSourceTrusted = (sourceType === '123' || sourceType === 'json');
     const nowTime = new Date();
-    const nowTimeISO = nowTime.toISOString();
     const files = jsonData?.files || [];
     const fileCount = files.length;
     
     logger.info({ seriesName, fileCount, sourceType }, `[Submit] 📥 收到入库请求 (安全分批版)`);
 
     try {
-        // 2. [元数据检查] 如果是重名/元数据变更，清理旧 STRM
-        // 注意：handleMetadataMigration 必须在 app.js 外部定义或引入
         const needRegenerateAll = await handleMetadataMigration({ 
             tmdbId, name: seriesName, year: seriesYear, genres, originalLanguage, originCountry 
         }, req.log);
         
-        // 3. [更新主表] 独立执行，不占用后续长事务
         await prisma.seriesMain.upsert({
             where: { tmdbId },
             update: {
@@ -805,28 +584,20 @@ app.post('/api/submit', async (req, reply) => {
             }
         });
         
-        // 变量准备
-        let createdEpisodeIds = []; // 收集 ID 用于生成 STRM
-        let pendingCount = 0;       // 统计待验证任务数
+        let pendingCount = 0;       
         
-        // 4. [分批处理核心]
         const BATCH_SIZE = 50; 
 
         for (let i = 0; i < files.length; i += BATCH_SIZE) {
             const batchFiles = files.slice(i, i + BATCH_SIZE);
-            const batchQueueTasks = []; // 本批次需要推送到 Redis 的任务
+            const batchQueueTasks = []; 
 
-            // 开启小事务
             await prisma.$transaction(async (tx) => {
                 if (isSourceTrusted) {
-                    // [优化] 3. Prisma 写入性能优化 (createMany)
-                    // --- A. 可信来源 (直接入库 SeriesEpisode) ---
-                    
-                    const videosMap = new Map(); // Key: "S|E", Value: Object (用于视频去重，保留最新)
+                    const videosMap = new Map(); 
                     const subtitlesList = [];
-                    const deleteSet = new Set(); // Set<"S|E"> (用于记录需要删除的集数)
+                    const deleteSet = new Set(); 
 
-                    // 1. 内存预处理数据
                     for (const file of batchFiles) {
                         const { season, episode } = parseSeasonEpisode(file.clean_name, type);
                         const tier = file.type || 'video';
@@ -839,9 +610,7 @@ app.post('/api/submit', async (req, reply) => {
                             });
                         } else {
                             const key = `${season}|${episode}`;
-                            // 记录需要删除的 S|E (仅视频)
                             deleteSet.add(key);
-                            // 记录需要插入的视频 (Map 会自动覆盖旧值，保留 batch 中最后一个)
                             videosMap.set(key, {
                                 tmdbId, season, episode, cleanName: file.clean_name, 
                                 etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
@@ -850,7 +619,6 @@ app.post('/api/submit', async (req, reply) => {
                         }
                     }
 
-                    // 2. 批量删除 (Delete Many)
                     if (deleteSet.size > 0) {
                         const orConditions = Array.from(deleteSet).map(s => {
                             const [season, episode] = s.split('|').map(Number);
@@ -866,31 +634,14 @@ app.post('/api/submit', async (req, reply) => {
                         });
                     }
 
-                    // 3. 批量插入 (Create Many)
                     const toInsert = [...videosMap.values(), ...subtitlesList];
                     if (toInsert.length > 0) {
                         await tx.seriesEpisode.createMany({
                             data: toInsert
                         });
-
-                        // 4. [补救措施] 找回 IDs
-                        // createMany 不返回 ID，我们需要查回来以便生成 STRM
-                        // 使用 etag 作为临时唯一标识 (在同一个 batch 内一般唯一)
-                        const insertedEtags = toInsert.map(e => e.etag);
-                        const fetchedEpisodes = await tx.seriesEpisode.findMany({
-                            where: {
-                                tmdbId: tmdbId,
-                                etag: { in: insertedEtags }
-                            },
-                            select: { id: true }
-                        });
-                        
-                        fetchedEpisodes.forEach(ep => createdEpisodeIds.push(ep.id));
                     }
 
                 } else {
-                    // --- B. 待验证来源 (入库 PendingEpisode) ---
-                    // 不可信来源需要逐个生成 Pending 记录并获取 ID 放入 Queue，因此不使用 createMany
                     for (const file of batchFiles) {
                         const { season, episode } = parseSeasonEpisode(file.clean_name, type);
                         
@@ -899,11 +650,10 @@ app.post('/api/submit', async (req, reply) => {
                                 tmdbId, season, episode, cleanName: file.clean_name, 
                                 etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
                                 type: file.type || 'video', sourceType, sourceRef: file.source_ref || '', 
-                                taskId: 'QUEUED' // 直接标记为 QUEUED，因为紧接着就会发 Redis
+                                taskId: 'QUEUED' 
                             }
                         });
 
-                        // 收集任务信息，等事务结束后再发 Redis
                         if (pending.id) {
                             batchQueueTasks.push({
                                 id: pending.id, cleanName: file.clean_name, 
@@ -915,60 +665,27 @@ app.post('/api/submit', async (req, reply) => {
                         }
                     }
                 }
-            }, { maxWait: 5000, timeout: 10000 }); // 设置 10秒 超时，防止死锁
+            }, { maxWait: 5000, timeout: 10000 }); 
 
-            // [关键优化] 事务成功提交后，才发送 Redis 任务
-            // 这样避免了 "数据库回滚了但 Redis 任务还在" 的脏数据问题
             if (batchQueueTasks.length > 0) {
-                // 并发推送到 Redis，提高速度
                 await Promise.all(batchQueueTasks.map(task => addToQueue(task)));
             }
 
-            // 让出 CPU 10ms，防止阻塞 HTTP 心跳检测和其他并发请求
             await new Promise(r => setTimeout(r, 10));
         }
 
         logger.info('[Submit] ✅ 数据库写入完成，开始后续处理...');
 
-        // 5. [后续处理] 生成 STRM (并发加速)
-        // 我们选择在这里 await，确保用户收到 response 时文件已存在，体验更好
-        if (isSourceTrusted && createdEpisodeIds.length > 0) {
-            logger.info({ count: createdEpisodeIds.length }, `[Submit] 🛠️ 正在生成 STRM 文件...`);
-            
-            // 使用 Promise.allLimit 或者简单的分块并发，防止文件系统 IO 爆炸
-            // 这里简单起见，使用 20 并发
-            const CHUNK = 20;
-            for (let j = 0; j < createdEpisodeIds.length; j += CHUNK) {
-                const chunkIds = createdEpisodeIds.slice(j, j + CHUNK);
-                await Promise.all(chunkIds.map(id => strmService.syncEpisode(id).catch(e => {
-                    logger.warn({ id, msg: e.message }, '[Submit] STRM 生成轻微报错(可忽略)');
-                })));
-            }
-            logger.info(`[Submit] STRM 生成完毕`);
-        }
-
-        // 6. [迁移处理] 如果元数据变了，重新生成旧的 STRM
-        if (needRegenerateAll) {
-            // 这个可以异步放后台跑，因为不影响新入库的观看
-            (async () => {
-                logger.info(`[Migration] 🔄 后台触发全量 STRM 刷新...`);
-                const allEps = await prisma.seriesEpisode.findMany({ where: { tmdbId } });
-                for (const ep of allEps) await strmService.syncEpisode(ep.id).catch(e => {});
-            })();
-        }
-
-        // [修改] 尝试精准清除，如果 tmdbId 存在
         if (tmdbId) {
             invalidateCacheByTmdbId(tmdbId).catch(err => logger.warn({ tmdbId, err }, 'Cache invalidation failed'));
         } else {
-            invalidateWebdavCache(); // 兜底全量清除
+            invalidateWebdavCache(); 
         }
 
         return { success: true, pendingCount: isSourceTrusted ? 0 : pendingCount };
 
     } catch (e) {
         logger.error(e, `[Submit] ❌ 提交处理失败`);
-        // 即使失败，Fastify 也会返回 500，客户端会知道出错了
         return reply.code(500).send({ success: false, error: e.message });
     }
 });
@@ -977,9 +694,7 @@ app.delete('/api/delete/series', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id) return { error: "Missing ID" };
     
-    // 1. 删除物理文件
-    const episodes = await prisma.seriesEpisode.findMany({ where: { tmdbId: id }, include: { series: true } });
-    for (const ep of episodes) await strmService.deleteEpisode(ep);
+    // [已移除] 物理文件删除逻辑
     
     // 2. 删除数据库记录
     await prisma.$transaction([
@@ -987,7 +702,6 @@ app.delete('/api/delete/series', async (req, reply) => {
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
     ]);
 
-    // [修改] 精准清除缓存
     if (id) {
         await invalidateCacheByTmdbId(id);
     } else {
@@ -1000,17 +714,15 @@ app.delete('/api/delete/series', async (req, reply) => {
 app.delete('/api/delete/episode', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id || isNaN(id)) return { error: "Missing Row ID" };
-    const ep = await prisma.seriesEpisode.findUnique({ where: { id }, include: { series: true } });
+    const ep = await prisma.seriesEpisode.findUnique({ where: { id } });
     
     let tmdbId = null;
 
     if (ep) {
-        tmdbId = ep.tmdbId; // 记录 ID 用于清除缓存
-        await strmService.deleteEpisode({ ...ep, series: ep.series });
+        tmdbId = ep.tmdbId; 
         await prisma.seriesEpisode.delete({ where: { id } });
     }
 
-    // [修改] 精准清除缓存
     if (tmdbId) {
         await invalidateCacheByTmdbId(tmdbId);
     } else {
@@ -1024,7 +736,7 @@ app.post('/api/webhook/upload', async (req, reply) => {
     const { secret, file_name, path, etag, size } = req.body;
     logger.info({ file_name, size }, `[Webhook] 收到上传通知`);
     
-    if (secret !== CALLBACK_SECRET) return reply.code(403).send({ error: 'Invalid Secret' });
+    if (secret !== SECRET) return reply.code(403).send({ error: 'Invalid Secret' });
     if (!file_name || !etag) return { status: 'error', message: 'Missing fields' };
     const tmdbMatch = file_name.match(RE_TMDB_TAG) || path.match(RE_TMDB_TAG);
     if (!tmdbMatch) return { status: 'error', message: 'Missing {tmdb=xxx} tag' };
@@ -1076,13 +788,11 @@ app.post('/api/webhook/upload', async (req, reply) => {
         const newEp = await tx.seriesEpisode.create({
             data: { tmdbId, season, episode, cleanName: standardizedName, etag, size: BigInt(size), score: newScore, type: isSubtitle ? 'subtitle' : 'video', createdAt: nowTime }
         });
-        strmService.syncEpisode(newEp.id).catch(e => console.error(e));
     });
     await addToQueue({
         id: -1, cleanName: standardizedName, type: 'verify_rapid', etag, size, tmdbId, season, episode, score: newScore, sourceType: 'webhook'
     });
 
-    // [修改] 精准清除缓存
     if (tmdbId) {
         await invalidateCacheByTmdbId(tmdbId);
     } else {
@@ -1111,6 +821,8 @@ app.get('/api/stream', async (req, reply) => {
         if (panType === '123') await create123RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === '189') await create189RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === 'quark') await createQuarkRapidTransfer(shareUrl, sharePassword, cookie, writer);
+        // [新增] 115 逻辑分支
+        else if (panType === '115') await create115RapidTransfer(shareUrl, sharePassword, writer);
         else throw new Error(`不支持的网盘类型: ${panType}`);
         logger.info(`[Stream] 解析完成`);
     } catch (e) {
@@ -1123,7 +835,7 @@ app.get('/api/stream', async (req, reply) => {
 
 app.post('/api/callback/123', async (req, reply) => {
     const { id, key } = req.query;
-    if (key !== CALLBACK_SECRET) return reply.code(403).send("Forbidden");
+    if (key !== SECRET) return reply.code(403).send("Forbidden");
     const body = req.body;
     logger.info({ id, status: body.status }, `[Callback] 收到 123 离线下载回调`);
     await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
@@ -1161,7 +873,6 @@ function parseSeasonEpisode(name, type) {
 }
 
 app.setNotFoundHandler((req, reply) => {
-    // 兼容 WebDAV 和 API 的 404 处理
     if (req.raw.url.startsWith('/api') || req.raw.url.startsWith('/webdav')) {
         reply.code(404).send({ error: 'API/WebDAV Not Found' });
     } else {

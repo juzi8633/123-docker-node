@@ -56,24 +56,49 @@ const handleInput = () => {
       } catch(e) {}
     }
 
+// 2. 网盘类型识别
     let type = ''
+    // [修正点1] 必须显式匹配 115cdn.com，否则无法识别
     if (/123(pan|865|684|912)\.(com|cn)/.test(val)) type = '123'
     else if (val.includes('189.cn')) type = '189'
+    else if (val.includes('115.com') || val.includes('115cdn.com')) type = '115' 
     else if (val.includes('quark.cn')) type = 'quark'
 
     if (type) {
       setDetectState(`${type} 网盘`, 'info')
-      const urlMatch = val.match(/https?:\/\/[a-zA-Z0-9\.\/\?\=\-\_]+/)
-      const pwdMatch = val.match(/(提取码|密码|访问码)[：:\s]*([a-zA-Z0-9]{4})/)
+      
+      // [修正点2] 使用更宽松的正则提取 URL，防止漏掉参数
+      const urlMatch = val.match(/https?:\/\/[^\s"']+/)
+      // 提取中文“密码：xxxx”的情况
+      const pwdMatch = val.match(/(提取码|密码|访问码|接收码)[：:\s]*([a-zA-Z0-9]{4,20})/)
       
       showLinkOptions.value = true
       panType.value = type
+      
       if (urlMatch) {
         shareUrl.value = urlMatch[0]
-        if (type === '123') { try { sharePassword.value = new URL(urlMatch[0]).searchParams.get('pwd') || '' } catch(e){} }
-        if (type === '189') { try { sharePassword.value = new URL(urlMatch[0]).searchParams.get('code') || '' } catch(e){} }
+        
+        // 尝试从 URL 参数中提取密码
+        try {
+            const urlObj = new URL(urlMatch[0])
+            if (type === '123') { 
+                sharePassword.value = urlObj.searchParams.get('pwd') || '' 
+            }
+            if (type === '189') { 
+                sharePassword.value = urlObj.searchParams.get('code') || '' 
+            }
+            if (type === '115') { 
+                // [修正点3] 针对您的链接 ?password=bill，这里能正确提取
+                // 同时也兼容标准链接的 ?receive_code=...
+                sharePassword.value = urlObj.searchParams.get('receive_code') || urlObj.searchParams.get('password') || '' 
+            }
+        } catch(e) {}
       }
-      if (pwdMatch && !sharePassword.value) sharePassword.value = pwdMatch[2]
+
+      // 如果 URL 里没找到密码，再看有没有中文正则匹配到的
+      if (pwdMatch && !sharePassword.value) {
+          sharePassword.value = pwdMatch[2]
+      }
       return
     }
     setDetectState('未知格式', 'error')

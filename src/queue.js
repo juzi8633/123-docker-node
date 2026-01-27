@@ -4,8 +4,7 @@ import { core123 } from './services/core123.js';
 import { prisma } from './db.js';
 import redis from './redis.js';
 import { createHash } from 'crypto';
-import { strmService } from './services/strm.js'; 
-import { createLogger } from './logger.js'; // [优化] 引入高性能日志模块
+import { createLogger } from './logger.js';
 
 // 初始化专用 Logger
 const logger = createLogger('Queue');
@@ -33,7 +32,6 @@ async function resolve189Link(sourceRef) {
     const url = `https://api.cloud.189.cn/open/file/getFileDownloadUrl.action?fileId=${fileId}&dt=1&shareId=${shareId}`;
     logger.debug(`[189Resolver] Requesting URL: ${url} (Sign: ${signature})`);
 
-    // [注] 这里的 fetch 会自动享受到 core123.js 中设置的全局 Agent 连接池优化
     const res = await fetch(url, {
         headers: { 'Sign-Type': '1', 'Accesstoken': token, 'Timestamp': String(timestamp), 'Signature': signature }
     });
@@ -108,10 +106,9 @@ const worker = new Worker('download-queue', async (job) => {
     }
 
     // ==================================================
-    // [修改点] 使用工兵账号进行秒传探测 (Probe)
+    // [使用工兵账号进行秒传探测]
     // ==================================================
     logger.debug(`[Probe] Calling core123.probeFileByHash...`);
-    // core123 内部已优化了 HTTP 连接池，这里响应会很快
     const canReuse = await core123.probeFileByHash(taskName, task.etag, Number(task.size));
     logger.info({ canReuse }, `[Probe] Result`);
 
@@ -140,18 +137,6 @@ const worker = new Worker('download-queue', async (job) => {
 
         await prisma.$transaction(ops);
         logger.info(`[DB] Transaction committed`);
-
-        // 触发 strm 生成
-        try {
-            const newEp = await prisma.seriesEpisode.findFirst({
-                where: { tmdbId: task.tmdbId, season: task.season, episode: task.episode, type: dbFileType },
-                orderBy: { id: 'desc' }
-            });
-            if (newEp) {
-                logger.info({ id: newEp.id }, `🔄 Triggering strm sync`);
-                await strmService.syncEpisode(newEp.id);
-            }
-        } catch (strmErr) { logger.error(strmErr, 'Strm sync error'); }
         
         await redis.del(LOCK_KEY);
         return { status: 'rapid_success' };
@@ -174,13 +159,12 @@ const worker = new Worker('download-queue', async (job) => {
         throw new Error(`无法获取下载直链`);
     }
 
-    const callbackKey = process.env.CALLBACK_SECRET;
+    const callbackKey = process.env.SECRET;
     const host = process.env.HOST_URL || 'http://localhost:3000'; 
     const callbackUrl = `${host}/api/callback/123?id=${rowId}&key=${callbackKey}`;
 
-    // [修改点] 离线下载必须使用 VIP 账号 Token
     const vipToken = await core123.getVipToken();
-    const parentID = await core123.getUploadParentID(); // 获取 VIP 缓存目录
+    const parentID = await core123.getUploadParentID();
     logger.info({ parentID, callbackUrl }, `[Offline] Submitting to 123 API`);
 
     const offlineRes = await fetch("https://open-api.123pan.com/api/v1/offline/download", {
@@ -224,11 +208,7 @@ const worker = new Worker('download-queue', async (job) => {
   }
 }, { 
     connection: REDIS_CONFIG,
-    // [优化] 提升并发度
-    // 由于 core123 已经有了连接池优化，且 probeFileByHash 是轻量 IO，
-    // 我们可以安全地提高并发，从原来的 1 提升到 10，大幅加快入库速度。
     concurrency: 1, 
-    // 放宽限流，不再强行等待 3 秒
     limiter: { max: 1, duration: 3000 }
 });
 

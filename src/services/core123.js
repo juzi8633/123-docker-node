@@ -424,31 +424,57 @@ export class Core123Service {
   }
 
   // === 工兵探测 (无删除) ===
-  async probeFileByHash(filename, etag, size) {
+  async probeFileByHash(filename, hash, size) {
       try {
           // 获取工兵 Token 和 Account 对象
           const { token, account } = await this.getWorkerToken();
           // 获取该工兵的缓存目录
           const parentID = await this.getCacheDirID(account, token);
-          const safeName = filename.replace(/[\\/:*?"<>|]/g, "_").substring(0, 90);
+          const safeName = filename.replace(/[\\/:*?"<>|]/g, "_").substring(0, 255); // 123限制255字符
 
-          log(`[Probe] Worker ${account.id} checking: ${safeName}`); // [日志]
+          log(`[Probe] Worker ${account.id} checking: ${safeName} (HashLen: ${hash.length})`);
 
-          const res = await this.fetchJson(`${this.domain}/upload/v2/file/create`, {
-              method: "POST",
-              headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform, "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                  parentFileID: parentID, 
-                  filename: safeName, 
-                  etag, 
-                  size: Number(size), 
-                  duplicate: 2 // 自动重命名，无所谓，反正是垃圾文件
-              })
-          });
+          let res;
+          
+          // [新增] 自动判断 Hash 类型
+          if (hash.length === 40) {
+              // === SHA1 模式 (115专享) ===
+              // API: /upload/v2/file/sha1_reuse
+              res = await this.fetchJson(`${this.domain}/upload/v2/file/sha1_reuse`, {
+                  method: "POST",
+                  headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform, "Content-Type": "application/json" },
+                  body: JSON.stringify({ 
+                      parentFileID: parentID, 
+                      filename: safeName, 
+                      sha1: hash, 
+                      size: Number(size), 
+                      duplicate: 2 // 覆盖
+                  })
+              });
+              
+              // 123的新接口返回结构: { code: 0, data: { reuse: true/false, fileID: ... } }
+              log(`[Probe SHA1] API Response:`, res);
+              return (res.code === 0 && res.data?.reuse === true);
 
-          log(`[Probe] API Response:`, res); // [日志] 核心：查看是否秒传成功
+          } else {
+              // === MD5 模式 (原有逻辑) ===
+              // API: /upload/v2/file/create
+              res = await this.fetchJson(`${this.domain}/upload/v2/file/create`, {
+                  method: "POST",
+                  headers: { "Authorization": `Bearer ${token}`, "Platform": this.platform, "Content-Type": "application/json" },
+                  body: JSON.stringify({ 
+                      parentFileID: parentID, 
+                      filename: safeName, 
+                      etag: hash, 
+                      size: Number(size), 
+                      duplicate: 2 
+                  })
+              });
 
-          return (res.code === 0 && res.data?.reuse === true);
+              log(`[Probe MD5] API Response:`, res);
+              return (res.code === 0 && res.data?.reuse === true);
+          }
+
       } catch (e) {
           console.warn(`[Probe Failed] ${e.message}`);
           return false;
