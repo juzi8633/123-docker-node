@@ -38,7 +38,6 @@ RUN npm install --omit=dev --registry=https://registry.npmmirror.com && \
 # 3. 复制后端源码 (利用 .dockerignore 排除 node_modules)
 COPY src/ ./src/
 COPY prisma/ ./prisma/
-COPY scripts/ ./scripts/
 
 # 4. 从第一阶段复制构建好的前端静态文件
 COPY --from=frontend-builder /app/ui/dist ./public
