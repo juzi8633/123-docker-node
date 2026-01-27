@@ -115,8 +115,8 @@ app.addHook('onRequest', async (req, reply) => {
     // 白名单放行逻辑（保持不变）
     if (url.startsWith('/api/webhook/upload') || 
         url.startsWith('/api/webhook/emby') || 
+        url.startsWith('/api/stream') || 
         url === '/' || 
-        url === '/index.html' || 
         url.includes('/assets/') || 
         url.startsWith('/webdav') || 
         url === '/favicon.ico') return;
