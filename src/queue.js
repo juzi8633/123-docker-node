@@ -145,8 +145,8 @@ const worker = new Worker('download-queue', async (job) => {
     // B. 秒传失败 -> 离线下载 (Fallback)
     logger.warn({ taskName }, `⚠️ 秒传失败，准备离线下载`);
 
-    if (task.sourceType === 'quark') {
-        throw new Error("夸克不支持离线下载");
+    if (task.sourceType === 'quark' && task.sourceType === '115') {
+        throw new Error("夸克和115不支持离线下载");
     }
 
     let downloadUrl = task.url; 

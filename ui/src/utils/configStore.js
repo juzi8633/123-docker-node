@@ -10,20 +10,7 @@ export const globalConfig = reactive({
     workerAccounts: '',
     open123DirId: '',
     rootFolderId: '',
-    // [新增] 189 Token 字段
     cloud189Token: '', 
-    // [新增] Host URL 字段
-    hostUrl: '',
-    // [新增] 同步策略字段
-    overwriteStrm: false,
-    overwriteSub: false,
-    skipSub: false,
-    
-    embyConfig: {
-        host: '',
-        api_key: '',
-        enabled: false
-    },
     isLoaded: false
 });
 
@@ -45,32 +32,6 @@ export async function initConfig() {
             globalConfig.open123DirId = d.open123_dir_id || '';
             globalConfig.rootFolderId = d.root_folder_id || '';
             globalConfig.cloud189Token = d.cloud189_token || '';
-            
-            // [新增] 映射 Host URL
-            globalConfig.hostUrl = d.host_url || '';
-            
-            // [新增] 映射同步策略
-            globalConfig.overwriteStrm = d.overwrite_strm === 'true';
-            globalConfig.overwriteSub = d.overwrite_sub === 'true';
-            globalConfig.skipSub = d.skip_sub === 'true';
-
-            // 解析 Emby 配置
-            if (d.emby_config) {
-                try {
-                    const parsed = JSON.parse(d.emby_config);
-                    globalConfig.embyConfig = {
-                        host: parsed.host || '',
-                        api_key: parsed.api_key || '',
-                        enabled: parsed.enabled === true
-                    };
-                } catch (e) {
-                    console.error('[ConfigStore] Failed to parse emby_config JSON', e);
-                    globalConfig.embyConfig = { host: '', api_key: '', enabled: false };
-                }
-            } else {
-                globalConfig.embyConfig = { host: '', api_key: '', enabled: false };
-            }
-            
             globalConfig.isLoaded = true;
             console.log('[ConfigStore] Configuration loaded from backend');
         }

@@ -112,8 +112,20 @@ app.addHook('onReady', async () => {
 
 app.addHook('onRequest', async (req, reply) => {
     const url = req.raw.url;
-    if (url.startsWith('/api/webhook/upload') || url.startsWith('/api/webhook/emby') || url === '/' || url === '/index.html' || url.includes('/assets/') || url.startsWith('/webdav') || url === '/favicon.ico') return;
-    if (SECRET && url.startsWith('/api') && req.headers['authorization'] !== SECRET) {}
+    // 白名单放行逻辑（保持不变）
+    if (url.startsWith('/api/webhook/upload') || 
+        url.startsWith('/api/webhook/emby') || 
+        url === '/' || 
+        url === '/index.html' || 
+        url.includes('/assets/') || 
+        url.startsWith('/webdav') || 
+        url === '/favicon.ico') return;
+
+    // 修复后的鉴权逻辑
+    if (SECRET && url.startsWith('/api') && req.headers['authorization'] !== SECRET) {
+        // 🚨 必须在这里发送响应来拦截请求
+        return reply.code(401).send({ error: 'Unauthorized: Invalid Secret' });
+    }
 });
 
 app.get('/api/health', async (req, reply) => {
@@ -498,6 +510,17 @@ app.post('/api/admin/import', async (req, reply) => {
                         }
                     }
                 });
+
+                if (distinctTmdbIds.length > 0) {
+                    await tx.seriesMain.updateMany({
+                        where: { 
+                            tmdbId: { in: distinctTmdbIds } 
+                        },
+                        data: { 
+                            lastUpdated: nowTime 
+                        }
+                    });
+                }
                 
                 count += batch.length;
                 
