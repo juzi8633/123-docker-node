@@ -433,7 +433,8 @@ async function handlePropfind(req, reply, pathStr, parts) {
 
     // 2. 生成 Weak ETag (基于路径 + 时间)
     // 只要 DB 里的时间没变，ETag 就不变，客户端就会走 304
-    const etagStr = `W/"${pathStr}-${folderLastMod.getTime()}"`;
+    const pathHash = crypto.createHash('md5').update(pathStr).digest('hex');
+    const etagStr = `W/"${pathHash}-${folderLastMod.getTime()}"`;
     
     reply.header('ETag', etagStr);
     if (req.headers['if-none-match'] === etagStr) {
