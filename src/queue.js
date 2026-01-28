@@ -109,11 +109,26 @@ const worker = new Worker('download-queue', async (job) => {
     // [使用工兵账号进行秒传探测]
     // ==================================================
     logger.debug(`[Probe] Calling core123.probeFileByHash...`);
-    const canReuse = await core123.probeFileByHash(taskName, task.etag, Number(task.size));
-    logger.info({ canReuse }, `[Probe] Result`);
+    
+    // [修改点 1] 接收返回值（可能是 boolean，也可能是包含 correctEtag 的对象）
+    const probeResult = await core123.probeFileByHash(taskName, task.etag, Number(task.size));
+    
+    // 判断是否成功：true 或 对象中 reuse 为 true
+    const canReuse = (probeResult === true) || (typeof probeResult === 'object' && probeResult.reuse === true);
+    
+    logger.info({ canReuse, result: typeof probeResult === 'object' ? 'Object' : probeResult }, `[Probe] Result`);
 
     if (canReuse) {
-        logger.info({ taskName }, `✅ 秒传成功 (工兵探测确认)`);
+        // [修改点 2] 确定最终入库的 ETag
+        // 如果是 SHA1 洗白成功，使用洗白后的 MD5 (correctEtag)
+        // 否则使用原始的 MD5 (task.etag)
+        let finalEtag = task.etag;
+        if (typeof probeResult === 'object' && probeResult.correctEtag) {
+            finalEtag = probeResult.correctEtag;
+            logger.info(`[Queue] ⚠️ 原始SHA1已洗白为MD5: ${finalEtag}`);
+        }
+
+        logger.info({ taskName, finalEtag }, `✅ 秒传成功 (工兵探测确认)`);
         
         const now = new Date();
         const ops = [];
@@ -127,7 +142,9 @@ const worker = new Worker('download-queue', async (job) => {
         ops.push(prisma.seriesEpisode.create({
             data: {
                 tmdbId: task.tmdbId, season: task.season, episode: task.episode,
-                cleanName: taskName, etag: task.etag, size: BigInt(task.size),
+                cleanName: taskName, 
+                etag: finalEtag, 
+                size: BigInt(task.size),
                 score: task.score || 0, type: dbFileType, createdAt: now
             }
         }));
