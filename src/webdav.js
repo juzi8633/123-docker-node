@@ -505,7 +505,10 @@ async function handleGet(req, reply, pathStr, parts) {
         'Accept-Ranges': 'bytes'
     };
 
-    if (req.method === 'HEAD') { reply.headers(headers); return reply.send(); }
+    if (req.method === 'HEAD') { 
+        reply.headers(headers); 
+        return reply.code(200).send(); 
+    }
 
     // [Step 3] 直链三级缓存
     const linkCacheKey = `${PREFIX_LINK}${file.etag}`;

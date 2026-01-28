@@ -11,7 +11,7 @@ dotenv.config();
 // =========================================================================
 const agent = new Agent({
     keepAliveTimeout: 15000, // 保持连接 15秒，复用 TCP
-    connections: 200,        // 最大并发连接数 (大幅提升秒传探测并发能力)
+    connections: 10,        // 最大并发连接数 (大幅提升秒传探测并发能力)
     pipelining: 1,           // HTTP/1.1 流水线
     connect: {
         timeout: 10000       // 连接超时 10秒
