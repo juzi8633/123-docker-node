@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// 剧集/电影主表
+model SeriesMain {
+  tmdbId          Int      @id @map("tmdb_id")
+  name            String
+  year            String?
+  type            String   // 'movie' or 'tv'
+  genres          String?  
+  
+  originalLanguage String? @map("original_language") 
+  originCountry    String? @map("origin_country")
+
+  lastUpdated     DateTime @default(now()) @map("last_updated")
+  
+  episodes        SeriesEpisode[]
+
+  // [原有索引] 用于分类过滤
+  @@index([type, originalLanguage])
+  @@index([type, genres])
+  
+  // [新增索引] 核心优化：用于 WebDAV 目录排序和时间戳聚合 (_max lastUpdated)
+  // 如果没有这个，getCategoryLastMod 查询会非常慢
+  @@index([lastUpdated]) 
+  
+  // [高级优化] 复合覆盖索引：加速 "WHERE type='movie' ORDER BY lastUpdated"
+  @@index([type, lastUpdated]) 
+
+  @@map("series_main")
+}
+
+// 剧集分集/文件表
+model SeriesEpisode {
+  id          Int      @id @default(autoincrement())
+  tmdbId      Int      @map("tmdb_id")
+  season      Int?
+  episode     Int?
+  cleanName   String   @map("clean_name")
+  size        BigInt
+  etag        String
+  score       Int      @default(0)
+  type        String   // 'video' or 'subtitle'
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  series      SeriesMain @relation(fields: [tmdbId], references: [tmdbId], onDelete: Cascade)
+
+  // ============ 索引优化区 ============
+
+  // 1. [核心智能匹配] 用于 handleGet 中的 S/E 逻辑查找
+  // 覆盖: where tmdbId, season, episode, type
+  @@index([tmdbId, season, episode, type]) 
+
+  // 2. [列表聚合] 用于计算季的总大小/时间，以及电影查找
+  // 覆盖: where tmdbId, type (电影) 或 where tmdbId, season, type (剧集季)
+  @@index([tmdbId, season, type])
+
+  // 3. [精确匹配兜底] 用于字幕、图片或非标准命名文件的查找
+  @@index([tmdbId, cleanName])
+
+  // 4. [最近更新] 用于 "最近更新" 文件夹的文件排序
+  @@index([createdAt])
+
+  @@map("series_episodes")
+}
+
+// 待处理任务表 (保持不变)
+model PendingEpisode {
+  id          Int      @id @default(autoincrement())
+  etag        String
+  tmdbId      Int      @map("tmdb_id")
+  season      Int
+  episode     Int
+  cleanName   String   @map("clean_name")
+  size        BigInt
+  score       Int
+  type        String
+  sourceType  String   @map("source_type") 
+  sourceRef   String?  @map("source_ref")
+  retryCount  Int      @default(0) @map("retry_count")
+  taskId      String?  @map("task_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  nextRetryAt BigInt   @default(0) @map("next_retry_at")
+  
+  @@index([etag])
+  @@map("pending_episodes")
+}
+
+// 系统配置表 (保持不变)
+model SystemConfig {
+  key         String   @id 
+  value       String   
+  description String?  
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("system_configs")
+}
