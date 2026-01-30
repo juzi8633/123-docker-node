@@ -8,10 +8,10 @@ import { LRUCache } from 'lru-cache';
 import { Readable } from 'stream';
 // 引入正则工具
 import { RE_SEASON_EPISODE } from './utils.js';
-// [修改] 引入项目统一日志模块
+// 引入项目统一日志模块
 import { createLogger } from './logger.js';
 
-// [修改] 初始化 WebDAV 专用 Logger，模块名为 'WebDAV'
+// 初始化 WebDAV 专用 Logger
 const logger = createLogger('WebDAV');
 
 // ==========================================
@@ -20,31 +20,27 @@ const logger = createLogger('WebDAV');
 const WEBDAV_USER = process.env.WEBDAV_USER || "admin";
 const WEBDAV_PASSWORD = process.env.WEBDAV_PASSWORD || "password";
 
-// [默认基准时间] 当分类为空或查不到时间时使用
+// [默认基准时间] 当分类为空或查不到时间时使用 (2023-01-01)
 const DEFAULT_DATE = new Date('2023-01-01T00:00:00Z');
-
-// [新] 虚拟文件夹阈值：当分类下条目超过此数值时，自动开启年份折叠
-const VIRTUAL_YEAR_THRESHOLD = 200; 
 
 // ==========================================
 // 2. 缓存策略
 // ==========================================
 const PREFIX_META = 'webdav:meta:';    // L1: 文件元数据缓存 (URL -> File Meta)
 const PREFIX_LINK = 'webdav:link:';    // L2: 下载直链缓存 (ETag -> 123 Link)
-const PREFIX_LIST = 'webdav:list:';    // L3: [新] 目录列表数据缓存 (PathHash -> JSON List)
-const PREFIX_LASTMOD = 'webdav:lmod:'; // L4: [新] 目录最后更新时间缓存 (PathHash -> Timestamp)
+const PREFIX_LIST = 'webdav:list:';    // L3: 目录列表 XML 数据缓存 (PathHash -> JSON List)
+const PREFIX_LASTMOD = 'webdav:lmod:'; // L4: 目录最后更新时间缓存 (PathHash -> Timestamp)
 
-// [新] 缓存时间策略：列表缓存改为 30 天 (近似永久)，依赖主动清除
 const TTL_REDIS_META = 3600;           // 元数据缓存 1 小时 (用于 GET 快速响应)
 const TTL_LINK = 3600 * 24 * 3;        // 直链缓存 3 天
 const TTL_LIST = 3600 * 24 * 30;       // 列表缓存 30 天 (写时失效)
-const TTL_LASTMOD = 3600 * 24 * 30;    // LastMod 缓存 30 天
+const TTL_LASTMOD = 3600;              // LastMod 缓存 1 小时 (作为安全网，防止缓存不一致死锁)
 
 // [L1 内存缓存]: 拦截毫秒级并发 (5秒过期)
 const lruCache = new LRUCache({ max: 1000, ttl: 1000 * 5 });
 
 // ==========================================
-// 3. 分类配置 (抽离为常量以便复用)
+// 3. 分类配置
 // ==========================================
 const CATEGORY_MAP = {
     '华语电影': { type: 'movie', OR: [{ originalLanguage: 'zh' }, { originalLanguage: 'cn' }], NOT: { genres: { contains: '16' } } },
@@ -109,31 +105,52 @@ function getYearDate(yearStr) {
 }
 
 /**
- * [新] 获取分类最后更新时间 (带 Redis 缓存)
+ * [核心] 通用目录时间获取函数
+ * 优先查 Redis，查不到则执行 queryFn 聚合查询
  */
-async function getCategoryLastModWithCache(categoryName, condition) {
-    const cacheKey = `${PREFIX_LASTMOD}${categoryName}`;
+async function getFolderLastMod(cacheKeySuffix, queryFn) {
+    const cacheKey = `${PREFIX_LASTMOD}${cacheKeySuffix}`;
     const cached = await redis.get(cacheKey);
     if (cached) return new Date(cached);
 
     try {
-        const agg = await prisma.seriesMain.aggregate({
-            where: condition,
-            _max: { lastUpdated: true }
-        });
-        const date = agg._max.lastUpdated || DEFAULT_DATE;
-        await redis.set(cacheKey, date.toISOString(), 'EX', TTL_LASTMOD);
-        return date;
+        const date = await queryFn();
+        // 如果查不到时间，使用 DEFAULT_DATE，确保不会因为 null 导致报错或时间变动
+        const validDate = date || DEFAULT_DATE;
+        await redis.set(cacheKey, validDate.toISOString(), 'EX', TTL_LASTMOD);
+        return validDate;
     } catch (e) {
-        // [修改] 使用统一日志记录警告
-        logger.warn({ categoryName, error: e.message }, `[警告] 获取分类最后更新时间失败`);
+        logger.warn({ cacheKey, error: e.message }, `[警告] 获取目录时间失败`);
         return DEFAULT_DATE;
     }
 }
 
 /**
- * 生成单条 WebDAV XML 片段
+ * [核心] 提取剧集时间的独立函数 (用于 Level 3/4)
  */
+async function getSeriesLastMod(namePart) {
+    const match = namePart.match(/\{tmdb-(\d+)\}/);
+    if (!match) return DEFAULT_DATE;
+    
+    const tmdbId = parseInt(match[1]);
+    return await getFolderLastMod(`tmdb:${tmdbId}`, async () => {
+        // 1. 优先取 SeriesMain 的 lastUpdated (刮削器更新时间)
+        const series = await prisma.seriesMain.findUnique({ 
+            where: { tmdbId }, 
+            select: { lastUpdated: true } 
+        });
+        if (series?.lastUpdated) return series.lastUpdated;
+        
+        // 2. 兜底取最新一集添加时间
+        const ep = await prisma.seriesEpisode.findFirst({
+            where: { tmdbId },
+            orderBy: { createdAt: 'desc' },
+            select: { createdAt: true }
+        });
+        return ep?.createdAt;
+    });
+}
+
 function genPropXML(href, displayName, isCollection, size, lastMod, creationDate, etag = "") {
     const modObj = lastMod ? new Date(lastMod) : DEFAULT_DATE;
     const createObj = creationDate ? new Date(creationDate) : modObj;
@@ -156,7 +173,7 @@ function pipelineCacheMeta(pipeline, f, tmdbId) {
 }
 
 // ==========================================
-// 5. XML 流式生成器 (核心：列表缓存 + 虚拟年份 + 反向索引)
+// 5. XML 流式生成器 (Scheme B: 强制年份折叠)
 // ==========================================
 async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
     yield `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">`;
@@ -172,12 +189,10 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
         const listCacheKey = `${PREFIX_LIST}${pathHash}`;
 
         // === [列表缓存检查] ===
-        // [修复] 移除 parts[0] !== '最近更新' 的限制，只要进入二级目录或非最近更新的一级目录，都允许读缓存
         if (parts.length >= 2 || (parts.length === 1 && parts[0] !== '最近更新')) {
              const cachedData = await redis.get(listCacheKey);
              if (cachedData) {
-                 // [修改] 记录缓存命中日志 (JSON结构)
-                 logger.info({ path: pathStr, hash: pathHash }, `[缓存命中] 列表缓存生效`);
+                 // logger.info({ path: pathStr }, `[缓存命中]`);
                  const list = JSON.parse(cachedData);
                  for (const item of list) {
                      yield genPropXML(item.href, item.name, item.isCol, item.size||0, item.lastMod, item.lastMod, item.etag||"");
@@ -187,17 +202,24 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
              }
         }
 
-        // [修改] 记录缓存未命中日志
-        logger.info({ path: pathStr }, `[缓存未命中] 正在生成实时数据`);
+        // logger.info({ path: pathStr }, `[缓存未命中] 生成实时数据`);
 
         // [Level 0] 根目录
         if (parts.length === 0) {
-            const [recentEp, movieTime, tvTime] = await Promise.all([
-                prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
-                getCategoryLastModWithCache('GLOBAL_MOVIE', { type: 'movie' }),
-                getCategoryLastModWithCache('GLOBAL_TV', { type: 'tv' })
+            const [recentTime, movieTime, tvTime] = await Promise.all([
+                 getFolderLastMod('RECENT', async () => {
+                     const ep = await prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } });
+                     return ep?.createdAt;
+                 }),
+                 getFolderLastMod('GLOBAL_MOVIE', async () => {
+                     const agg = await prisma.seriesMain.aggregate({ where: { type: 'movie' }, _max: { lastUpdated: true } });
+                     return agg._max.lastUpdated;
+                 }),
+                 getFolderLastMod('GLOBAL_TV', async () => {
+                     const agg = await prisma.seriesMain.aggregate({ where: { type: 'tv' }, _max: { lastUpdated: true } });
+                     return agg._max.lastUpdated;
+                 })
             ]);
-            const recentTime = recentEp?.createdAt || DEFAULT_DATE;
 
             yield genPropXML(`${basePathForXml}/最近更新`, '最近更新', true, 0, recentTime, recentTime);
             yield genPropXML(`${basePathForXml}/电影`, '电影', true, 0, movieTime, movieTime);
@@ -236,11 +258,15 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                     }
                 }
             } else {
+                // 处理“电影”、“电视剧”或“华语电影”等
                 const isMovie = folderName === '电影';
                 for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
                     const isTarget = (isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv');
                     if (isTarget) {
-                        const catTime = await getCategoryLastModWithCache(catName, condition);
+                        const catTime = await getFolderLastMod(catName, async () => {
+                             const agg = await prisma.seriesMain.aggregate({ where: condition, _max: { lastUpdated: true } });
+                             return agg._max.lastUpdated;
+                        });
                         const href = `${basePathForXml}/${encodeURIComponent(catName)}`;
                         yield genPropXML(href, catName, true, 0, catTime, catTime);
                     }
@@ -248,64 +274,42 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             }
         }
         
-        // [Level 2] 具体分类浏览 (年份折叠核心逻辑)
+        // [Level 2] 具体分类浏览 -> 强制年份折叠
         else if (parts.length === 2 && parts[0] !== '最近更新') {
             const [typeFolder, category] = parts;
             const condition = CATEGORY_MAP[category];
             
             if (condition) {
-                const count = await prisma.seriesMain.count({ where: condition });
                 const itemsToCache = [];
 
-                if (count >= VIRTUAL_YEAR_THRESHOLD) {
-                    // 开启年份折叠
-                    const groups = await prisma.seriesMain.groupBy({
-                        by: ['year'],
-                        where: condition,
-                        _max: { lastUpdated: true },
-                        orderBy: { year: 'desc' }
-                    });
+                // 无条件聚合年份，不再判断 count
+                const groups = await prisma.seriesMain.groupBy({
+                    by: ['year'],
+                    where: condition,
+                    _max: { lastUpdated: true },
+                    orderBy: { year: 'desc' }
+                });
+                
+                const yearFolders = [];
+                let otherGroup = null;
+
+                for (const g of groups) {
+                    if (!g.year) {
+                        if (!otherGroup) otherGroup = { year: '其他', lastMod: g._max.lastUpdated };
+                        else if (g._max.lastUpdated > otherGroup.lastMod) otherGroup.lastMod = g._max.lastUpdated;
+                    } else {
+                        yearFolders.push({ year: g.year, lastMod: g._max.lastUpdated });
+                    }
+                }
+                if (otherGroup) yearFolders.push(otherGroup);
+
+                for (const yf of yearFolders) {
+                    const rowName = yf.year;
+                    const href = `${basePathForXml}/${encodeURIComponent(rowName)}`;
+                    const lastModStr = yf.lastMod ? yf.lastMod.toISOString() : DEFAULT_DATE.toISOString();
                     
-                    const yearFolders = [];
-                    let otherGroup = null;
-
-                    for (const g of groups) {
-                        if (!g.year) {
-                            if (!otherGroup) otherGroup = { year: '其他', lastMod: g._max.lastUpdated };
-                            else if (g._max.lastUpdated > otherGroup.lastMod) otherGroup.lastMod = g._max.lastUpdated;
-                        } else {
-                            yearFolders.push({ year: g.year, lastMod: g._max.lastUpdated });
-                        }
-                    }
-                    if (otherGroup) yearFolders.push(otherGroup);
-
-                    for (const yf of yearFolders) {
-                        const rowName = yf.year;
-                        const href = `${basePathForXml}/${encodeURIComponent(rowName)}`;
-                        const lastModStr = yf.lastMod ? yf.lastMod.toISOString() : DEFAULT_DATE.toISOString();
-                        
-                        yield genPropXML(href, rowName, true, 0, yf.lastMod, yf.lastMod);
-                        itemsToCache.push({ href, name: rowName, isCol: true, lastMod: lastModStr });
-                    }
-
-                } else {
-                    // 保持直列
-                    const seriesList = await prisma.seriesMain.findMany({
-                        where: condition,
-                        select: { tmdbId: true, name: true, year: true, lastUpdated: true },
-                        orderBy: { lastUpdated: 'desc' },
-                        take: 2000
-                    });
-
-                    for (const s of seriesList) {
-                        const safeNameStr = sanitizeName(s.name);
-                        const rowName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
-                        const href = `${basePathForXml}/${encodeURIComponent(rowName)}`;
-                        const lastModStr = s.lastUpdated ? s.lastUpdated.toISOString() : DEFAULT_DATE.toISOString();
-                        
-                        yield genPropXML(href, rowName, true, 0, s.lastUpdated, getYearDate(s.year));
-                        itemsToCache.push({ href, name: rowName, isCol: true, lastMod: lastModStr });
-                    }
+                    yield genPropXML(href, rowName, true, 0, yf.lastMod, yf.lastMod);
+                    itemsToCache.push({ href, name: rowName, isCol: true, lastMod: lastModStr });
                 }
 
                 if (itemsToCache.length > 0) {
@@ -315,10 +319,12 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
         }
 
         // [Level 3] 年份文件夹详情
-        else if (parts.length === 3 && parts[1] !== '最近更新' && (/^\d{4}$/.test(parts[2]) || parts[2] === '其他')) {
+        else if (parts.length === 3 && parts[1] !== '最近更新') {
             const [typeFolder, category, subNode] = parts;
+            // 只有当 subNode 看起来像年份或'其他'时才处理
+            const isYearNode = /^\d{4}$/.test(subNode) || subNode === '其他';
             
-            if (!subNode.includes('{tmdb-')) {
+            if (isYearNode) {
                 const condition = CATEGORY_MAP[category];
                 if (condition) {
                     const yearCondition = subNode === '其他' 
@@ -349,7 +355,7 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             }
         }
         
-        // [Level 3/4] 剧集详情页与反向索引
+        // [Level 3/4] 剧集详情页 (包含文件或 Season 文件夹)
         if (parts.length > 0) {
             const lastPart = parts[parts.length - 1];
             const prevPart = parts.length >= 2 ? parts[parts.length - 2] : null;
@@ -456,7 +462,6 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
 export async function handleWebDavRequest(req, reply) {
     const auth = req.headers['authorization'];
     if (!auth) {
-        // [修改] 记录警告日志
         logger.warn(`[鉴权失败] 未提供认证头`);
         reply.header('WWW-Authenticate', 'Basic realm="123NodeServer"');
         return reply.code(401).send('Unauthorized');
@@ -465,7 +470,6 @@ export async function handleWebDavRequest(req, reply) {
     if (!/^Basic$/i.test(scheme) || !encoded) return reply.code(400).send('Bad Request');
     const [user, pass] = Buffer.from(encoded, 'base64').toString().split(':');
     if (user !== WEBDAV_USER || pass !== WEBDAV_PASSWORD) {
-        // [修改] 记录认证失败日志
         logger.warn({ user }, `[鉴权拒绝] 用户名或密码错误`);
         return reply.code(403).send('Forbidden');
     }
@@ -476,7 +480,6 @@ export async function handleWebDavRequest(req, reply) {
     const parts = urlPath.split('/').filter(p => p);
     const method = req.method.toUpperCase();
 
-    // [修改] 记录请求日志
     logger.info({ method, path: urlPath }, `收到 WebDAV 请求`);
 
     try {
@@ -493,52 +496,121 @@ export async function handleWebDavRequest(req, reply) {
             case 'LOCK': return handleDummyLock(req, reply, urlPath);
             case 'UNLOCK': return reply.code(204).send();
             default: 
-                // [修改] 记录不支持的方法日志
+                // [优化] 对于不支持的写操作，直接 403，减少客户端报错
+                if (['PUT', 'DELETE', 'MKCOL', 'MOVE', 'COPY'].includes(method)) {
+                    logger.debug({ method, path: urlPath }, `[只读模式] 拦截写操作`);
+                    return reply.code(403).send('Forbidden');
+                }
                 logger.warn({ method, path: urlPath }, `[警告] 未支持的方法`);
                 return reply.code(405).send('Method Not Allowed');
         }
     } catch (e) {
-        // [修改] 记录严重错误
         logger.error({ err: e, path: urlPath }, `[严重错误] 处理请求失败`);
         return reply.code(500).send('Internal Server Error');
     }
 }
 
 // ==========================================
-// 7. PROPFIND 处理器 (304 协商缓存)
+// 7. PROPFIND 处理器 (支持 304)
 // ==========================================
 async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     let folderLastMod = DEFAULT_DATE;
 
     try {
+        // [Level 0] 根目录
         if (parts.length === 0) {
-             const [recentEp, movieTime, tvTime] = await Promise.all([
-                prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
-                getCategoryLastModWithCache('GLOBAL_MOVIE', { type: 'movie' }),
-                getCategoryLastModWithCache('GLOBAL_TV', { type: 'tv' })
-             ]);
-             const recentTime = recentEp?.createdAt || DEFAULT_DATE;
-             const maxTime = Math.max(recentTime.getTime(), movieTime.getTime(), tvTime.getTime());
-             folderLastMod = new Date(maxTime);
+            folderLastMod = await getFolderLastMod('ROOT', async () => {
+                const [recentEp, movieTime, tvTime] = await Promise.all([
+                    prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } }),
+                    prisma.seriesMain.aggregate({ where: { type: 'movie' }, _max: { lastUpdated: true } }),
+                    prisma.seriesMain.aggregate({ where: { type: 'tv' }, _max: { lastUpdated: true } })
+                ]);
+                const t1 = recentEp?.createdAt?.getTime() || 0;
+                const t2 = movieTime._max.lastUpdated?.getTime() || 0;
+                const t3 = tvTime._max.lastUpdated?.getTime() || 0;
+                return new Date(Math.max(t1, t2, t3));
+            });
 
-        } else if (parts.length === 1 && parts[0] === '最近更新') {
-             const recentEp = await prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } });
-             folderLastMod = recentEp?.createdAt || DEFAULT_DATE;
-
-        } else if (parts.length === 1 && parts[0] !== '最近更新') {
-             const folderName = parts[0]; 
-             const isMovie = folderName === '电影'; 
-             if (isMovie || folderName === '电视剧') {
-                 const type = isMovie ? 'movie' : 'tv';
-                 folderLastMod = await getCategoryLastModWithCache(`GLOBAL_${type.toUpperCase()}`, { type });
-             } 
+        } else if (parts.length === 1) {
+            // [Level 1]
+            const folderName = parts[0];
+            if (folderName === '最近更新') {
+                 folderLastMod = await getFolderLastMod('RECENT', async () => {
+                     const ep = await prisma.seriesEpisode.findFirst({ orderBy: { createdAt: 'desc' }, select: { createdAt: true } });
+                     return ep?.createdAt;
+                 });
+            } else {
+                 const isMovie = folderName === '电影';
+                 const isTv = folderName === '电视剧';
+                 if (isMovie || isTv) {
+                     const type = isMovie ? 'movie' : 'tv';
+                     folderLastMod = await getFolderLastMod(`GLOBAL_${type.toUpperCase()}`, async () => {
+                         const agg = await prisma.seriesMain.aggregate({ where: { type }, _max: { lastUpdated: true } });
+                         return agg._max.lastUpdated;
+                     });
+                 } else {
+                     const condition = CATEGORY_MAP[folderName];
+                     if (condition) {
+                         folderLastMod = await getFolderLastMod(folderName, async () => {
+                             const agg = await prisma.seriesMain.aggregate({ where: condition, _max: { lastUpdated: true } });
+                             return agg._max.lastUpdated;
+                         });
+                     }
+                 }
+            }
         } else if (parts.length === 2 && parts[0] !== '最近更新') {
-             const condition = CATEGORY_MAP[parts[1]];
-             if (condition) folderLastMod = await getCategoryLastModWithCache(parts[1], condition);
-        } else {
-             folderLastMod = new Date();
+             // [Level 2] 分类 -> (现在全是) 年份文件夹
+             // 例如 /webdav/电影/华语电影 -> 这里的 folderLastMod 是 "华语电影" 这个目录本身的时间
+             const categoryName = parts[1];
+             const condition = CATEGORY_MAP[categoryName];
+             if (condition) {
+                 folderLastMod = await getFolderLastMod(categoryName, async () => {
+                     const agg = await prisma.seriesMain.aggregate({ where: condition, _max: { lastUpdated: true } });
+                     return agg._max.lastUpdated;
+                 });
+             }
+        } else if (parts.length >= 3 && parts[1] !== '最近更新') {
+             // [Level 3] 年份内部 / 剧集
+             const categoryName = parts[1];
+             const subNode = parts[2]; // 年份 或 '其他'
+             const condition = CATEGORY_MAP[categoryName];
+             
+             if (condition) {
+                 const isYear = /^\d{4}$/.test(subNode);
+                 const isOther = subNode === '其他';
+                 
+                 if (isYear || isOther) {
+                     // 访问的是年份目录本身，获取该年份下内容的最后更新时间
+                     const yearVal = isYear ? subNode : null;
+                     const yearCondition = isOther 
+                         ? { OR: [{ year: null }, { year: '' }] }
+                         : { year: yearVal };
+
+                     folderLastMod = await getFolderLastMod(`${categoryName}:${subNode}`, async () => {
+                         const agg = await prisma.seriesMain.aggregate({
+                             where: { ...condition, ...yearCondition },
+                             _max: { lastUpdated: true }
+                         });
+                         return agg._max.lastUpdated;
+                     });
+                 } else {
+                     // 已经进入剧集或更深层
+                     const time = await getSeriesLastMod(subNode);
+                     if (time) folderLastMod = time;
+                 }
+             }
         }
+
+        // 兜底：如果 URL 包含 tmdb id，尝试获取剧集时间
+        if (parts.length > 0) {
+            const lastPart = parts[parts.length - 1];
+            if (lastPart.includes('{tmdb-')) {
+                 const time = await getSeriesLastMod(lastPart);
+                 if (time && time > DEFAULT_DATE) folderLastMod = time;
+            }
+        }
+
     } catch(e) {
         logger.warn({ err: e }, '计算文件夹时间失败，使用默认值');
     }
@@ -548,7 +620,6 @@ async function handlePropfind(req, reply, pathStr, parts) {
     
     reply.header('ETag', etagStr);
     if (req.headers['if-none-match'] === etagStr) {
-        // [修改] 记录304日志
         logger.info({ path: pathStr }, `[304命中] 客户端缓存有效`);
         return reply.code(304).send();
     }
@@ -567,6 +638,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
 async function handleGet(req, reply, pathStr, parts) {
     const fileName = decodeURIComponent(parts[parts.length - 1]);
     let tmdbId = null;
+    // 强制扫描所有层级寻找 tmdbId，不受目录结构影响
     for(const part of parts) {
         const match = part.match(/\{tmdb-(\d+)\}/);
         if(match) { tmdbId = parseInt(match[1]); break; }
@@ -656,11 +728,9 @@ async function handleGet(req, reply, pathStr, parts) {
 
     if (downloadUrl) {
         isHit = true; 
-        // [修改] 记录直链缓存命中
         logger.info({ fileName, etag: file.etag }, `[直链缓存命中] 重定向播放`);
     } else {
         try {
-            // [修改] 记录直链生成请求
             logger.info({ fileName }, `[直链缓存未命中] 正在获取新直链`);
             downloadUrl = await core123.getDownloadUrlByHash(file.cleanName, file.etag, Number(file.size));
             if (downloadUrl) {
@@ -669,7 +739,6 @@ async function handleGet(req, reply, pathStr, parts) {
                 throw new Error('123云盘未返回有效的下载地址');
             }
         } catch (e) {
-            // [修改] 记录直链获取失败
             logger.error({ err: e, fileName }, `[获取直链失败]`);
             return reply.code(502).send('Upstream Error');
         }
@@ -706,7 +775,6 @@ function sendXml(reply, xml) {
 // ==========================================
 export async function invalidateCacheByTmdbId(tmdbId) {
     if (!tmdbId) return;
-    // [修改] 记录主动清理日志
     logger.info({ tmdbId }, `[主动缓存清理] 触发清理`);
     
     const tmdbIdInt = parseInt(tmdbId);
@@ -719,21 +787,30 @@ export async function invalidateCacheByTmdbId(tmdbId) {
 
         const pipelines = redis.pipeline();
 
-        // 1. 清除详情页 (通过反向索引)
+        // 1. 清除根目录和入口分类时间戳 (Critical: 保证入口能刷新)
+        pipelines.del(`${PREFIX_LASTMOD}ROOT`);
+        pipelines.del(`${PREFIX_LASTMOD}RECENT`);
+        const typeKey = series.type === 'movie' ? 'GLOBAL_MOVIE' : 'GLOBAL_TV';
+        pipelines.del(`${PREFIX_LASTMOD}${typeKey}`);
+        
+        // 2. 清除详情页 (通过反向索引)
         const mappingKey = `dav:mapping:tmdb:${tmdbId}`;
         const relatedCacheKeys = await redis.smembers(mappingKey);
         
         if (relatedCacheKeys.length > 0) {
             pipelines.unlink(relatedCacheKeys);
             pipelines.unlink(mappingKey);
-            logger.info({ count: relatedCacheKeys.length }, `[清理详情页] 完成`);
         }
+        
+        // 3. 清除该剧集的自身时间戳
+        pipelines.del(`${PREFIX_LASTMOD}tmdb:${tmdbId}`);
 
-        // 2. 清除分类列表逻辑
+        // 4. 清除分类列表逻辑 & 分类时间戳
         const targetCategories = [];
         for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
             let match = true;
             if (condition.type !== series.type) match = false;
+            // 简单的条件匹配逻辑
             if (match && condition.OR) {
                 const langMatch = condition.OR.some(c => c.originalLanguage === series.originalLanguage);
                 if (!langMatch) match = false;
@@ -758,18 +835,23 @@ export async function invalidateCacheByTmdbId(tmdbId) {
         for (const cat of targetCategories) {
             const catPath = `${rootPath}/${cat}`;
             const catHash = crypto.createHash('md5').update(catPath).digest('hex');
+            
+            // (a) 清除分类列表缓存
             pipelines.del(`${PREFIX_LIST}${catHash}`);
+            // (b) 清除分类时间戳
             pipelines.del(`${PREFIX_LASTMOD}${cat}`); 
             
+            // (c) 清除年份相关的缓存 (因强制折叠，年份目录必存在)
             if (series.year) {
                 const yearPath = `${catPath}/${series.year}`;
                 const yearHash = crypto.createHash('md5').update(yearPath).digest('hex');
                 pipelines.del(`${PREFIX_LIST}${yearHash}`);
-            }
-            if (!series.year) {
+                pipelines.del(`${PREFIX_LASTMOD}${cat}:${series.year}`);
+            } else {
                 const otherPath = `${catPath}/其他`;
                 const otherHash = crypto.createHash('md5').update(otherPath).digest('hex');
                 pipelines.del(`${PREFIX_LIST}${otherHash}`);
+                pipelines.del(`${PREFIX_LASTMOD}${cat}:其他`);
             }
         }
         
@@ -777,15 +859,16 @@ export async function invalidateCacheByTmdbId(tmdbId) {
         const recentHash = crypto.createHash('md5').update(recentPath).digest('hex');
         pipelines.del(`${PREFIX_LIST}${recentHash}`);
 
+        // 5. 清除元数据
         const tmdbStr = String(tmdbId);
         const metaStream = redis.scanStream({ match: `${PREFIX_META}${tmdbStr}:*`, count: 100 });
         metaStream.on('data', keys => { if (keys.length) redis.unlink(keys); });
 
         await pipelines.exec();
-        logger.info(`[清理完成] 关联列表已重置`);
+        logger.info(`[清理完成] 关联列表及时间戳已重置`);
 
     } catch (e) { 
-        logger.error({ err: e, tmdbId }, `[错误] 缓存清理失败`);
+        logger.error({ err: e, tmdbId }, `[严重] 缓存清理失败`);
     }
 }
 
