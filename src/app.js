@@ -24,7 +24,6 @@ import { createLogger } from './logger.js';
 import { create123RapidTransfer } from "./services/service123.js";
 import { create189RapidTransfer } from "./services/service189.js";
 import { createQuarkRapidTransfer } from "./services/serviceQuark.js";
-import { create115RapidTransfer } from "./services/service115.js"; // [新增] 引入 115 服务
 
 import { 
     analyzeName, 
@@ -644,8 +643,6 @@ app.get('/api/stream', async (req, reply) => {
         if (panType === '123') await create123RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === '189') await create189RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === 'quark') await createQuarkRapidTransfer(shareUrl, sharePassword, cookie, writer);
-        // [新增] 115 逻辑分支
-        else if (panType === '115') await create115RapidTransfer(shareUrl, sharePassword, writer);
         else throw new Error(`不支持的网盘类型: ${panType}`);
         logger.info(`[Stream] 解析完成`);
     } catch (e) {

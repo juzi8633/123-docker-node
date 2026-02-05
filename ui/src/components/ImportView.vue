@@ -58,10 +58,8 @@ const handleInput = () => {
 
 // 2. 网盘类型识别
     let type = ''
-    // [修正点1] 必须显式匹配 115cdn.com，否则无法识别
     if (/123(pan|865|684|912)\.(com|cn)/.test(val)) type = '123'
     else if (val.includes('189.cn')) type = '189'
-    else if (val.includes('115.com') || val.includes('115cdn.com')) type = '115' 
     else if (val.includes('quark.cn')) type = 'quark'
 
     if (type) {
@@ -86,11 +84,6 @@ const handleInput = () => {
             }
             if (type === '189') { 
                 sharePassword.value = urlObj.searchParams.get('code') || '' 
-            }
-            if (type === '115') { 
-                // [修正点3] 针对您的链接 ?password=bill，这里能正确提取
-                // 同时也兼容标准链接的 ?receive_code=...
-                sharePassword.value = urlObj.searchParams.get('receive_code') || urlObj.searchParams.get('password') || '' 
             }
         } catch(e) {}
       }

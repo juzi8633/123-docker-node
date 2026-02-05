@@ -35,7 +35,7 @@ export class Web123Client {
             this.setToken(this.token);
         }
 
-        // this._setupInterceptors();
+        this._setupInterceptors();
     }
 
     setToken(token) {
@@ -387,7 +387,7 @@ export class Web123Client {
         let path = infoResp.data?.downloadPath || "";
 
         const finalUrl = `${host}${path}`;
-        
+
         logger.info({ finalUrl }, `✅ 直链获取成功`);
 
         return finalUrl;

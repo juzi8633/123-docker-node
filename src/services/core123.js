@@ -182,24 +182,19 @@ export class Core123Service {
   // =======================================================
   // 核心业务 2: 秒传探测
   // =======================================================
-  async probeFileByHash(filename, hash, size) {
+  async probeFileByHash(filename, etag, size) {
       try {
           const client = await this.getWorkerClient();
           const safeName = filename.replace(/[\\/:*?"<>|]/g, "_").substring(0, 255);
-          
           const fileMeta = {
-              fileName: safeName, size: Number(size), duplicate: 2 
+              fileName: safeName, size: Number(size), duplicate: 2, etag, type: 0
           };
-          if (hash.length === 40) fileMeta.sha1 = hash; else fileMeta.etag = hash;
 
-          await new Promise(r => setTimeout(r, 500)); // 简易限流
+          await new Promise(r => setTimeout(r, 1000)); // 简易限流
 
           const res = await client.uploadRequest(fileMeta);
           if (res.code === 0 && res.data && res.data.Reuse) {
               const result = { reuse: true };
-              if (hash.length === 40 && res.data.Info?.Etag) {
-                  result.correctEtag = res.data.Info.Etag;
-              }
               if (res.data.Info?.S3KeyFlag) {
                   result.S3KeyFlag = res.data.Info.S3KeyFlag;
               }
@@ -207,7 +202,7 @@ export class Core123Service {
           }
           return false;
       } catch (e) {
-          logger.warn({ err: e.message }, `[Probe] 探测异常`);
+          logger.warn({ err: e.message, filename}, `[Probe] 探测异常`);
           return false;
       }
   }

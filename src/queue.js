@@ -121,7 +121,7 @@ const worker = new Worker('download-queue', async (job) => {
     }
 
     // 3. 离线下载 (使用 core123 封装)
-    if (task.sourceType === 'quark' || task.sourceType === '115') throw new Error("夸克和115不支持离线下载");
+    if (task.sourceType === 'quark') throw new Error("夸克不支持离线下载");
 
     let downloadUrl = task.url; 
     if (task.sourceType === '189') {
