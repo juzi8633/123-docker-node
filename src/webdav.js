@@ -427,7 +427,7 @@ export async function handleWebDavRequest(req, reply) {
     const parts = urlPath.split('/').filter(p => p);
     const method = req.method.toUpperCase();
 
-    logger.info({ method, path: urlPath }, `收到 WebDAV 请求`);
+    // logger.info({ method, path: urlPath }, `收到 WebDAV 请求`);
 
     try {
         switch (method) {
@@ -678,7 +678,7 @@ async function handleGet(req, reply, pathStr, parts) {
 
     if (downloadUrl) {
         isHit = true; 
-        logger.info({ fileName, etag: file.etag }, `[直链缓存命中] ${isStrmRequest ? '返回直链文本' : '重定向播放'}`);
+        logger.info({ fileName }, `[直链缓存命中] ${isStrmRequest ? '返回直链文本' : '重定向播放'}`);
     } else {
         try {
             logger.info({ fileName }, `[直链缓存未命中] 正在获取新直链`);
