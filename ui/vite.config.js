@@ -20,6 +20,7 @@ export default defineConfig({
     proxy: {
       // 场景 A: 如果你的前端请求都有统一前缀，比如 fetch('/api/list')
       '/api': {
+        // target: 'http://localhost:3000', // 后端地址
         target: 'http://192.168.0.103:3000', // 后端地址
         changeOrigin: true,              // 允许跨域
         // rewrite: (path) => path.replace(/^\/api/, '') // 如果后端接口本身不带 /api，把这行注释打开

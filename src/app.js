@@ -21,7 +21,6 @@ import redis from './redis.js';
 import { core123 } from './services/core123.js';
 import { createLogger } from './logger.js'; 
 
-
 import { create123RapidTransfer } from "./services/service123.js";
 import { create189RapidTransfer } from "./services/service189.js";
 import { createQuarkRapidTransfer } from "./services/serviceQuark.js";
@@ -39,6 +38,7 @@ import {
     safeParseYear
 } from './utils.js';
 
+// 解决 Prisma BigInt 序列化问题
 BigInt.prototype.toJSON = function () { return this.toString(); };
 
 dotenv.config();
@@ -92,6 +92,7 @@ app.addHook('onReady', async () => {
         await redis.ping();
         
         logger.info('正在检查数据库连接...');
+        // 使用 await 确保 DB 连接正常
         await prisma.$queryRaw`SELECT 1`; 
         
         if (core123.reloadConfig) {
@@ -100,6 +101,7 @@ app.addHook('onReady', async () => {
             app.log.info('✅ [System] Core123 配置已加载');
         }
 
+        // 初始化缓存目录
         await core123.initLinkCacheFolder();
 
         app.log.info('✅ [System] Redis & SQLite 连接成功');
@@ -257,7 +259,7 @@ app.get('/api/config', async (req, reply) => {
 
 app.post('/api/config', async (req, reply) => {
     logger.info('[Config] 收到配置保存请求');
-    const { configs, overwrite_strm, overwrite_sub, skip_sub } = req.body;
+    const { configs } = req.body;
     
     let finalConfigs = {};
     if (configs) {
@@ -266,10 +268,6 @@ app.post('/api/config', async (req, reply) => {
         finalConfigs = { ...req.body };
     }
     
-    if (overwrite_strm !== undefined) finalConfigs.overwrite_strm = String(overwrite_strm);
-    if (overwrite_sub !== undefined) finalConfigs.overwrite_sub = String(overwrite_sub);
-    if (skip_sub !== undefined) finalConfigs.skip_sub = String(skip_sub);
-
     try {
         const operations = Object.entries(finalConfigs).map(([key, value]) => {
             if (key === 'configs') return null;
@@ -433,7 +431,7 @@ app.post('/api/submit', async (req, reply) => {
                             subtitlesList.push({
                                 tmdbId, season, episode, cleanName: file.clean_name, 
                                 etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
-                                type: tier, createdAt: nowTime
+                                type: tier, createdAt: nowTime, S3KeyFlag: file.S3KeyFlag || ''
                             });
                         } else {
                             const key = `${season}|${episode}`;
@@ -441,7 +439,7 @@ app.post('/api/submit', async (req, reply) => {
                             videosMap.set(key, {
                                 tmdbId, season, episode, cleanName: file.clean_name, 
                                 etag: file.etag, size: BigInt(file.size), score: file.score || 0, 
-                                type: tier, createdAt: nowTime
+                                type: tier, createdAt: nowTime, S3KeyFlag: file.S3KeyFlag || ''
                             });
                         }
                     }
@@ -504,6 +502,7 @@ app.post('/api/submit', async (req, reply) => {
         logger.info('[Submit] ✅ 数据库写入完成，开始后续处理...');
 
         if (tmdbId) {
+            // [修改] 确保调用正确的清理函数，使 WebDAV 立即生效
             invalidateCacheByTmdbId(tmdbId).catch(err => logger.warn({ tmdbId, err }, 'Cache invalidation failed'));
         } else {
             invalidateWebdavCache(); 
@@ -557,7 +556,7 @@ app.delete('/api/delete/episode', async (req, reply) => {
 });
 
 app.post('/api/webhook/upload', async (req, reply) => {
-    const { secret, file_name, path, etag, size } = req.body;
+    const { secret, file_name, path, etag, size, s3_key_flag='' } = req.body;
     logger.info({ file_name, size }, `[Webhook] 收到上传通知`);
     
     if (secret !== SECRET) return reply.code(403).send({ error: 'Invalid Secret' });
@@ -572,7 +571,7 @@ app.post('/api/webhook/upload', async (req, reply) => {
     let series = await prisma.seriesMain.findUnique({ where: { tmdbId } });
     if (!series) {
         const meta = await fetchTmdbMeta(tmdbId, mediaType);
-        const name = meta ? (meta.name || meta.title) : file_name.split('.')[0];
+        const name = meta.name || meta.title;
         const year = meta ? (meta.first_air_date || meta.release_date || '').split('-')[0] : '';
         const genres = meta ? meta.genres.map(g => g.id).join(',') : '';
         const originalLanguage = meta ? meta.original_language : null;
@@ -610,7 +609,7 @@ app.post('/api/webhook/upload', async (req, reply) => {
     await prisma.$transaction(async (tx) => {
         if (!isSubtitle) await tx.seriesEpisode.deleteMany({ where: { tmdbId, season, episode, type: { not: 'subtitle' } } });
         const newEp = await tx.seriesEpisode.create({
-            data: { tmdbId, season, episode, cleanName: standardizedName, etag, size: BigInt(size), score: newScore, type: isSubtitle ? 'subtitle' : 'video', createdAt: nowTime }
+            data: { tmdbId, season, episode, cleanName: standardizedName, etag, size: BigInt(size), score: newScore, type: isSubtitle ? 'subtitle' : 'video', createdAt: nowTime ,S3KeyFlag: s3_key_flag || "" }
         });
     });
     await addToQueue({

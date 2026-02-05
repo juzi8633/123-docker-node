@@ -10,6 +10,7 @@
     "@fastify/compress": "^7.0.3",
     "@fastify/static": "^7.0.0",
     "@prisma/client": "^5.22.0",
+    "axios": "^1.13.4",
     "better-sqlite3": "^9.4.3",
     "bullmq": "^5.66.5",
     "dotenv": "^16.4.5",

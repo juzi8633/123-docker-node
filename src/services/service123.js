@@ -88,7 +88,6 @@ export async function create123RapidTransfer(shareUrl, sharePwd = '', writer) {
         totalSize: files.reduce((sum, f) => sum + f.size, 0),
     };
 
-    // logger.debug({ ...finalJson, files: `[Array(${files.length})]` }, '生成的最终 JSON (部分)');
     await sendEvent(writer, 'result', { rapidTransferJson: finalJson });
     logger.info('结果已发送给客户端');
 }
@@ -130,7 +129,7 @@ async function get123ShareFiles(shareKey, sharePwd = '', parentFileId = 0, path 
                 await get123ShareFiles(shareKey, sharePwd, item.FileId, itemPath, writer, allFiles);
             } else { // 文件
                 // logger.debug(`发现文件: ${item.FileName}`);
-                allFiles.push({ path: itemPath, etag: (item.Etag || "").toLowerCase(), size: item.Size });
+                allFiles.push({ path: itemPath, etag: (item.Etag || "").toLowerCase(), size: item.Size, S3KeyFlag: item.S3KeyFlag });
                 
                 // 每增加 5 个文件或者总数很少时发送一次进度，减少 SSE 流量
                 if (allFiles.length % 5 === 0 || allFiles.length < 10) {

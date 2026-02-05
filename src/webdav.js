@@ -91,7 +91,7 @@ function getMimeType(filename) {
     const ext = path.extname(filename).toLowerCase();
     const map = {
         '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.jpg': 'image/jpeg', '.png': 'image/png',
-        '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.strm': 'application/vnd.apple.mpegurl',
+        '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.strm': 'text/plain', 
         '.srt': 'text/plain', '.ass': 'text/plain', '.vtt': 'text/vtt', '.nfo': 'text/xml'
     };
     return map[ext] || 'application/octet-stream';
@@ -104,10 +104,6 @@ function getYearDate(yearStr) {
     return new Date(`${y}-01-01T00:00:00Z`);
 }
 
-/**
- * [核心] 通用目录时间获取函数
- * 优先查 Redis，查不到则执行 queryFn 聚合查询
- */
 async function getFolderLastMod(cacheKeySuffix, queryFn) {
     const cacheKey = `${PREFIX_LASTMOD}${cacheKeySuffix}`;
     const cached = await redis.get(cacheKey);
@@ -115,7 +111,6 @@ async function getFolderLastMod(cacheKeySuffix, queryFn) {
 
     try {
         const date = await queryFn();
-        // 如果查不到时间，使用 DEFAULT_DATE，确保不会因为 null 导致报错或时间变动
         const validDate = date || DEFAULT_DATE;
         await redis.set(cacheKey, validDate.toISOString(), 'EX', TTL_LASTMOD);
         return validDate;
@@ -125,23 +120,18 @@ async function getFolderLastMod(cacheKeySuffix, queryFn) {
     }
 }
 
-/**
- * [核心] 提取剧集时间的独立函数 (用于 Level 3/4)
- */
 async function getSeriesLastMod(namePart) {
     const match = namePart.match(/\{tmdb-(\d+)\}/);
     if (!match) return DEFAULT_DATE;
     
     const tmdbId = parseInt(match[1]);
     return await getFolderLastMod(`tmdb:${tmdbId}`, async () => {
-        // 1. 优先取 SeriesMain 的 lastUpdated (刮削器更新时间)
         const series = await prisma.seriesMain.findUnique({ 
             where: { tmdbId }, 
             select: { lastUpdated: true } 
         });
         if (series?.lastUpdated) return series.lastUpdated;
         
-        // 2. 兜底取最新一集添加时间
         const ep = await prisma.seriesEpisode.findFirst({
             where: { tmdbId },
             orderBy: { createdAt: 'desc' },
@@ -173,7 +163,7 @@ function pipelineCacheMeta(pipeline, f, tmdbId) {
 }
 
 // ==========================================
-// 5. XML 流式生成器 (Scheme B: 强制年份折叠)
+// 5. XML 流式生成器
 // ==========================================
 async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
     yield `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">`;
@@ -188,11 +178,9 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
         const pathHash = crypto.createHash('md5').update(pathStr).digest('hex');
         const listCacheKey = `${PREFIX_LIST}${pathHash}`;
 
-        // === [列表缓存检查] ===
         if (parts.length >= 2 || (parts.length === 1 && parts[0] !== '最近更新')) {
              const cachedData = await redis.get(listCacheKey);
              if (cachedData) {
-                 // logger.info({ path: pathStr }, `[缓存命中]`);
                  const list = JSON.parse(cachedData);
                  for (const item of list) {
                      yield genPropXML(item.href, item.name, item.isCol, item.size||0, item.lastMod, item.lastMod, item.etag||"");
@@ -202,9 +190,6 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
              }
         }
 
-        // logger.info({ path: pathStr }, `[缓存未命中] 生成实时数据`);
-
-        // [Level 0] 根目录
         if (parts.length === 0) {
             const [recentTime, movieTime, tvTime] = await Promise.all([
                  getFolderLastMod('RECENT', async () => {
@@ -225,11 +210,8 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             yield genPropXML(`${basePathForXml}/电影`, '电影', true, 0, movieTime, movieTime);
             yield genPropXML(`${basePathForXml}/电视剧`, '电视剧', true, 0, tvTime, tvTime);
         }
-        
-        // [Level 1] 分类/最近更新
         else if (parts.length === 1) {
             const folderName = parts[0]; 
-            
             if (folderName === '最近更新') {
                 const recentEpisodes = await prisma.seriesEpisode.groupBy({
                     by: ['tmdbId'], _max: { createdAt: true }, orderBy: { _max: { createdAt: 'desc' } }, take: 50
@@ -237,19 +219,16 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                 const recentMeta = await prisma.seriesMain.findMany({
                     orderBy: { lastUpdated: 'desc' }, take: 50, select: { tmdbId: true, lastUpdated: true }
                 });
-
                 const mixedIds = new Set([
                     ...recentEpisodes.map(e => e.tmdbId),
                     ...recentMeta.map(m => m.tmdbId)
                 ]);
-
                 if (mixedIds.size > 0) {
                     const seriesList = await prisma.seriesMain.findMany({
                         where: { tmdbId: { in: Array.from(mixedIds) } },
                         select: { tmdbId: true, name: true, year: true, lastUpdated: true },
                         orderBy: { lastUpdated: 'desc' }, take: 50
                     });
-
                     for (const s of seriesList) {
                         const safeNameStr = sanitizeName(s.name);
                         const rowName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
@@ -258,7 +237,6 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                     }
                 }
             } else {
-                // 处理“电影”、“电视剧”或“华语电影”等
                 const isMovie = folderName === '电影';
                 for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
                     const isTarget = (isMovie && condition.type === 'movie') || (!isMovie && condition.type === 'tv');
@@ -273,26 +251,19 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                 }
             }
         }
-        
-        // [Level 2] 具体分类浏览 -> 强制年份折叠
         else if (parts.length === 2 && parts[0] !== '最近更新') {
             const [typeFolder, category] = parts;
             const condition = CATEGORY_MAP[category];
-            
             if (condition) {
                 const itemsToCache = [];
-
-                // 无条件聚合年份，不再判断 count
                 const groups = await prisma.seriesMain.groupBy({
                     by: ['year'],
                     where: condition,
                     _max: { lastUpdated: true },
                     orderBy: { year: 'desc' }
                 });
-                
                 const yearFolders = [];
                 let otherGroup = null;
-
                 for (const g of groups) {
                     if (!g.year) {
                         if (!otherGroup) otherGroup = { year: '其他', lastMod: g._max.lastUpdated };
@@ -302,52 +273,39 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                     }
                 }
                 if (otherGroup) yearFolders.push(otherGroup);
-
                 for (const yf of yearFolders) {
                     const rowName = yf.year;
                     const href = `${basePathForXml}/${encodeURIComponent(rowName)}`;
                     const lastModStr = yf.lastMod ? yf.lastMod.toISOString() : DEFAULT_DATE.toISOString();
-                    
                     yield genPropXML(href, rowName, true, 0, yf.lastMod, yf.lastMod);
                     itemsToCache.push({ href, name: rowName, isCol: true, lastMod: lastModStr });
                 }
-
                 if (itemsToCache.length > 0) {
                     await redis.set(listCacheKey, JSON.stringify(itemsToCache), 'EX', TTL_LIST);
                 }
             }
         }
-
-        // [Level 3] 年份文件夹详情
         else if (parts.length === 3 && parts[1] !== '最近更新') {
             const [typeFolder, category, subNode] = parts;
-            // 只有当 subNode 看起来像年份或'其他'时才处理
             const isYearNode = /^\d{4}$/.test(subNode) || subNode === '其他';
-            
             if (isYearNode) {
                 const condition = CATEGORY_MAP[category];
                 if (condition) {
-                    const yearCondition = subNode === '其他' 
-                        ? { OR: [{ year: null }, { year: '' }] }
-                        : { year: subNode };
-                    
+                    const yearCondition = subNode === '其他' ? { OR: [{ year: null }, { year: '' }] } : { year: subNode };
                     const seriesList = await prisma.seriesMain.findMany({
                         where: { ...condition, ...yearCondition },
                         select: { tmdbId: true, name: true, year: true, lastUpdated: true },
                         orderBy: { lastUpdated: 'desc' }
                     });
-
                     const itemsToCache = [];
                     for (const s of seriesList) {
                         const safeNameStr = sanitizeName(s.name);
                         const rowName = `${safeNameStr} (${s.year || 'Unknown'}) {tmdb-${s.tmdbId}}`;
                         const href = `${basePathForXml}/${encodeURIComponent(rowName)}`;
                         const lastModStr = s.lastUpdated ? s.lastUpdated.toISOString() : DEFAULT_DATE.toISOString();
-
                         yield genPropXML(href, rowName, true, 0, s.lastUpdated, getYearDate(s.year));
                         itemsToCache.push({ href, name: rowName, isCol: true, lastMod: lastModStr });
                     }
-                    
                     if (itemsToCache.length > 0) {
                         await redis.set(listCacheKey, JSON.stringify(itemsToCache), 'EX', TTL_LIST);
                     }
@@ -355,11 +313,9 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             }
         }
         
-        // [Level 3/4] 剧集详情页 (包含文件或 Season 文件夹)
         if (parts.length > 0) {
             const lastPart = parts[parts.length - 1];
             const prevPart = parts.length >= 2 ? parts[parts.length - 2] : null;
-            
             const tmdbIdMatch = lastPart ? lastPart.match(/\{tmdb-(\d+)\}/) : null;
             const seasonMatch = lastPart ? lastPart.match(/Season (\d+)/) : null;
             const parentIdMatch = prevPart ? prevPart.match(/\{tmdb-(\d+)\}/) : null;
@@ -367,7 +323,6 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             if (tmdbIdMatch && !seasonMatch) {
                 const tmdbId = parseInt(tmdbIdMatch[1]);
                 const seriesInfo = await prisma.seriesMain.findUnique({ where: { tmdbId }, select: { type: true } });
-
                 const itemsToCache = [];
                 const pipeline = redis.pipeline();
 
@@ -376,14 +331,15 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                         where: { tmdbId, type: { not: 'subtitle' } },
                         select: { cleanName: true, size: true, createdAt: true, etag: true }
                     });
-                    
                     for (const f of files) {
-                        const href = `${basePathForXml}/${encodeURIComponent(f.cleanName)}`;
-                        yield genPropXML(href, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
+                        const originalExt = path.extname(f.cleanName);
+                        const strmName = f.cleanName.replace(originalExt, '.strm');
+                        const strmSize = 100; 
+                        const href = `${basePathForXml}/${encodeURIComponent(strmName)}`;
+                        yield genPropXML(href, strmName, false, strmSize, f.createdAt, f.createdAt, f.etag);
                         pipelineCacheMeta(pipeline, f, tmdbId);
-                        
                         itemsToCache.push({ 
-                            href, name: f.cleanName, isCol: false, size: String(f.size), 
+                            href, name: strmName, isCol: false, size: String(strmSize), 
                             lastMod: f.createdAt.toISOString(), etag: f.etag 
                         });
                     }
@@ -396,19 +352,14 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                         _sum: { size: true } 
                     });
                     seasonCounts.sort((a, b) => (a.season||0) - (b.season||0));
-                    
                     for (const s of seasonCounts) {
                         const seasonName = `Season ${String(s.season).padStart(2, '0')}`;
                         const lastMod = s._max.createdAt || DEFAULT_DATE;
                         const href = `${basePathForXml}/${encodeURIComponent(seasonName)}`;
                         yield genPropXML(href, seasonName, true, s._sum.size, lastMod, s._min.createdAt);
-
-                        itemsToCache.push({ 
-                            href, name: seasonName, isCol: true, size: 0, lastMod: lastMod.toISOString() 
-                        });
+                        itemsToCache.push({ href, name: seasonName, isCol: true, size: 0, lastMod: lastMod.toISOString() });
                     }
                 }
-
                 if (itemsToCache.length > 0) {
                     pipeline.set(listCacheKey, JSON.stringify(itemsToCache), 'EX', TTL_LIST);
                     const mappingKey = `dav:mapping:tmdb:${tmdbId}`;
@@ -417,31 +368,28 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
                 }
                 pipeline.exec().catch(() => {});
             }
-            
             else if (parentIdMatch && seasonMatch) {
                 const tmdbId = parseInt(parentIdMatch[1]);
                 const season = parseInt(seasonMatch[1]);
-
                 const files = await prisma.seriesEpisode.findMany({
                     where: { tmdbId, season, type: { not: 'subtitle' } }, 
                     select: { cleanName: true, size: true, createdAt: true, etag: true },
                     orderBy: { episode: 'asc' }
                 });
-
                 const itemsToCache = [];
                 const pipeline = redis.pipeline();
-
                 for (const f of files) {
-                    const href = `${basePathForXml}/${encodeURIComponent(f.cleanName)}`;
-                    yield genPropXML(href, f.cleanName, false, f.size, f.createdAt, f.createdAt, f.etag);
+                    const originalExt = path.extname(f.cleanName);
+                    const strmName = f.cleanName.replace(originalExt, '.strm');
+                    const strmSize = 100;
+                    const href = `${basePathForXml}/${encodeURIComponent(strmName)}`;
+                    yield genPropXML(href, strmName, false, strmSize, f.createdAt, f.createdAt, f.etag);
                     pipelineCacheMeta(pipeline, f, tmdbId);
-
                     itemsToCache.push({ 
-                        href, name: f.cleanName, isCol: false, size: String(f.size), 
+                        href, name: strmName, isCol: false, size: String(strmSize), 
                         lastMod: f.createdAt.toISOString(), etag: f.etag 
                     });
                 }
-                
                 if (itemsToCache.length > 0) {
                     pipeline.set(listCacheKey, JSON.stringify(itemsToCache), 'EX', TTL_LIST);
                     const mappingKey = `dav:mapping:tmdb:${tmdbId}`;
@@ -452,7 +400,6 @@ async function* xmlStreamGenerator(pathStr, parts, depth, req, folderLastMod) {
             }
         }
     }
-
     yield `</D:multistatus>`;
 }
 
@@ -496,7 +443,6 @@ export async function handleWebDavRequest(req, reply) {
             case 'LOCK': return handleDummyLock(req, reply, urlPath);
             case 'UNLOCK': return reply.code(204).send();
             default: 
-                // [优化] 对于不支持的写操作，直接 403，减少客户端报错
                 if (['PUT', 'DELETE', 'MKCOL', 'MOVE', 'COPY'].includes(method)) {
                     logger.debug({ method, path: urlPath }, `[只读模式] 拦截写操作`);
                     return reply.code(403).send('Forbidden');
@@ -511,14 +457,13 @@ export async function handleWebDavRequest(req, reply) {
 }
 
 // ==========================================
-// 7. PROPFIND 处理器 (支持 304)
+// 7. PROPFIND 处理器
 // ==========================================
 async function handlePropfind(req, reply, pathStr, parts) {
     const depth = req.headers['depth'] || '1';
     let folderLastMod = DEFAULT_DATE;
 
     try {
-        // [Level 0] 根目录
         if (parts.length === 0) {
             folderLastMod = await getFolderLastMod('ROOT', async () => {
                 const [recentEp, movieTime, tvTime] = await Promise.all([
@@ -531,9 +476,7 @@ async function handlePropfind(req, reply, pathStr, parts) {
                 const t3 = tvTime._max.lastUpdated?.getTime() || 0;
                 return new Date(Math.max(t1, t2, t3));
             });
-
         } else if (parts.length === 1) {
-            // [Level 1]
             const folderName = parts[0];
             if (folderName === '最近更新') {
                  folderLastMod = await getFolderLastMod('RECENT', async () => {
@@ -560,8 +503,6 @@ async function handlePropfind(req, reply, pathStr, parts) {
                  }
             }
         } else if (parts.length === 2 && parts[0] !== '最近更新') {
-             // [Level 2] 分类 -> (现在全是) 年份文件夹
-             // 例如 /webdav/电影/华语电影 -> 这里的 folderLastMod 是 "华语电影" 这个目录本身的时间
              const categoryName = parts[1];
              const condition = CATEGORY_MAP[categoryName];
              if (condition) {
@@ -571,22 +512,15 @@ async function handlePropfind(req, reply, pathStr, parts) {
                  });
              }
         } else if (parts.length >= 3 && parts[1] !== '最近更新') {
-             // [Level 3] 年份内部 / 剧集
              const categoryName = parts[1];
-             const subNode = parts[2]; // 年份 或 '其他'
+             const subNode = parts[2];
              const condition = CATEGORY_MAP[categoryName];
-             
              if (condition) {
                  const isYear = /^\d{4}$/.test(subNode);
                  const isOther = subNode === '其他';
-                 
                  if (isYear || isOther) {
-                     // 访问的是年份目录本身，获取该年份下内容的最后更新时间
                      const yearVal = isYear ? subNode : null;
-                     const yearCondition = isOther 
-                         ? { OR: [{ year: null }, { year: '' }] }
-                         : { year: yearVal };
-
+                     const yearCondition = isOther ? { OR: [{ year: null }, { year: '' }] } : { year: yearVal };
                      folderLastMod = await getFolderLastMod(`${categoryName}:${subNode}`, async () => {
                          const agg = await prisma.seriesMain.aggregate({
                              where: { ...condition, ...yearCondition },
@@ -595,14 +529,11 @@ async function handlePropfind(req, reply, pathStr, parts) {
                          return agg._max.lastUpdated;
                      });
                  } else {
-                     // 已经进入剧集或更深层
                      const time = await getSeriesLastMod(subNode);
                      if (time) folderLastMod = time;
                  }
              }
         }
-
-        // 兜底：如果 URL 包含 tmdb id，尝试获取剧集时间
         if (parts.length > 0) {
             const lastPart = parts[parts.length - 1];
             if (lastPart.includes('{tmdb-')) {
@@ -610,7 +541,6 @@ async function handlePropfind(req, reply, pathStr, parts) {
                  if (time && time > DEFAULT_DATE) folderLastMod = time;
             }
         }
-
     } catch(e) {
         logger.warn({ err: e }, '计算文件夹时间失败，使用默认值');
     }
@@ -638,7 +568,6 @@ async function handlePropfind(req, reply, pathStr, parts) {
 async function handleGet(req, reply, pathStr, parts) {
     const fileName = decodeURIComponent(parts[parts.length - 1]);
     let tmdbId = null;
-    // 强制扫描所有层级寻找 tmdbId，不受目录结构影响
     for(const part of parts) {
         const match = part.match(/\{tmdb-(\d+)\}/);
         if(match) { tmdbId = parseInt(match[1]); break; }
@@ -649,39 +578,47 @@ async function handleGet(req, reply, pathStr, parts) {
         return reply.code(403).send('Directory listing not allowed via GET');
     }
 
+    const isStrmRequest = fileName.endsWith('.strm');
     const extMatch = fileName.match(/\.(\w+)$/);
     const ext = extMatch ? extMatch[1].toLowerCase() : '';
     const isVideo = ['mp4', 'mkv', 'avi', 'mov', 'strm'].includes(ext);
 
     let file = null;
-    const cacheKeyMeta = `${PREFIX_META}${tmdbId}:${fileName}`;
-
-    // [Step 1] 视频文件优先走智能匹配 (Smart Match)
+    
+    // [Step 1] 文件查找
     if (isVideo) {
-        file = lruCache.get(cacheKeyMeta);
-        
-        if (!file) {
-            const seMatch = fileName.match(RE_SEASON_EPISODE); 
-            
-            if (seMatch) {
-                const season = parseInt(seMatch[1]);
-                const episode = parseInt(seMatch[2]);
-                file = await prisma.seriesEpisode.findFirst({
-                    where: { tmdbId, season, episode, type: { not: 'subtitle' } },
-                    select: { cleanName: true, etag: true, size: true, createdAt: true }
-                });
-            } else {
-                file = await prisma.seriesEpisode.findFirst({
+        const seMatch = fileName.match(RE_SEASON_EPISODE); 
+        if (seMatch) {
+            const season = parseInt(seMatch[1]);
+            const episode = parseInt(seMatch[2]);
+            file = await prisma.seriesEpisode.findFirst({
+                where: { tmdbId, season, episode, type: { not: 'subtitle' } },
+                select: { cleanName: true, etag: true, size: true, createdAt: true }
+            });
+        } else {
+            if (isStrmRequest) {
+                 file = await prisma.seriesEpisode.findFirst({
                     where: { tmdbId, type: { not: 'subtitle' } },
                     orderBy: { size: 'desc' },
                     select: { cleanName: true, etag: true, size: true, createdAt: true }
                 });
+            } else {
+                 const cacheKeyMeta = `${PREFIX_META}${tmdbId}:${fileName}`;
+                 file = lruCache.get(cacheKeyMeta);
+                 if (!file) {
+                     file = await prisma.seriesEpisode.findFirst({
+                        where: { tmdbId, type: { not: 'subtitle' } },
+                        orderBy: { size: 'desc' },
+                        select: { cleanName: true, etag: true, size: true, createdAt: true }
+                     });
+                 }
             }
         }
     }
 
-    // [Step 2] 兜底精确匹配
+    // [Step 2] 兜底匹配
     if (!file) {
+        const cacheKeyMeta = `${PREFIX_META}${tmdbId}:${fileName}`;
         file = lruCache.get(cacheKeyMeta);
         if (!file) {
             const cachedMetaStr = await redis.get(cacheKeyMeta);
@@ -702,33 +639,46 @@ async function handleGet(req, reply, pathStr, parts) {
         return reply.code(404).send('File not found');
     }
 
-    if (isVideo && !lruCache.has(cacheKeyMeta)) {
-         const cacheData = { ...file, size: String(file.size) };
-         await redis.set(cacheKeyMeta, JSON.stringify(cacheData), 'EX', TTL_REDIS_META);
-         lruCache.set(cacheKeyMeta, file);
-    }
-
+    // [Step 2.5] 提前构造 Headers 并拦截 HEAD 请求
+    // 目的：避免 HEAD 请求触发下方的 getDownloadUrlByHash，从而触发 123 网盘的风控
     const headers = {
-        'Content-Type': getMimeType(file.cleanName), 
-        'Content-Length': String(file.size),
         'Last-Modified': new Date(file.createdAt).toUTCString(),
         'ETag': `"${file.etag}"`,
         'Accept-Ranges': 'bytes'
     };
 
-    if (req.method === 'HEAD') { 
-        reply.headers(headers); 
-        return reply.code(200).send(); 
+    if (isStrmRequest) {
+        headers['Content-Type'] = 'text/plain; charset=utf-8';
+        // [关键] HEAD 请求时不获取直链，无法得知直链的确切长度。
+        // 这里返回一个伪造的小长度 (如 100 字节)
+        // 播放器只会检查 200 OK 状态码，不会验证这个 Content-Length 是否与后续 GET 的内容完全一致
+        headers['Content-Length'] = '100'; 
+    } else {
+        headers['Content-Type'] = getMimeType(file.cleanName);
+        headers['Content-Length'] = String(file.size);
     }
 
-    // [Step 3] 直链三级缓存
+    // [关键修复] 如果是 HEAD 请求，在此直接返回，切断后续流程
+    if (req.method === 'HEAD') {
+        reply.headers(headers);
+        return reply.code(200).send();
+    }
+
+    // [Step 3] 只有 GET 请求才会执行到这里，获取直链
+    // 更新元数据缓存 (仅针对真实文件名的请求)
+    if (isVideo && !isStrmRequest && !lruCache.has(`${PREFIX_META}${tmdbId}:${fileName}`)) {
+         const cacheData = { ...file, size: String(file.size) };
+         await redis.set(`${PREFIX_META}${tmdbId}:${fileName}`, JSON.stringify(cacheData), 'EX', TTL_REDIS_META);
+         lruCache.set(`${PREFIX_META}${tmdbId}:${fileName}`, file);
+    }
+
     const linkCacheKey = `${PREFIX_LINK}${file.etag}`;
     let downloadUrl = await redis.get(linkCacheKey);
     let isHit = false;
 
     if (downloadUrl) {
         isHit = true; 
-        logger.info({ fileName, etag: file.etag }, `[直链缓存命中] 重定向播放`);
+        logger.info({ fileName, etag: file.etag }, `[直链缓存命中] ${isStrmRequest ? '返回直链文本' : '重定向播放'}`);
     } else {
         try {
             logger.info({ fileName }, `[直链缓存未命中] 正在获取新直链`);
@@ -747,7 +697,16 @@ async function handleGet(req, reply, pathStr, parts) {
     reply.header('Cache-Control', `public, max-age=${TTL_LINK}`);
     reply.header('X-Drive-Cache', isHit ? 'HIT' : 'MISS');
     
-    return reply.redirect(downloadUrl);
+    // [STRM模式] 返回直链内容
+    if (isStrmRequest) {
+        reply.header('Content-Type', 'text/plain; charset=utf-8');
+        // GET 请求时我们有了真实的 URL，返回真实的长度
+        reply.header('Content-Length', Buffer.byteLength(downloadUrl));
+        reply.header('Last-Modified', new Date(file.createdAt).toUTCString());
+        return reply.code(200).send(downloadUrl);
+    } else {
+        return reply.redirect(downloadUrl);
+    }
 }
 
 // ==========================================
@@ -771,7 +730,7 @@ function sendXml(reply, xml) {
 }
 
 // ==========================================
-// 10. 缓存清理接口 (全链路精准清除)
+// 10. 缓存清理接口
 // ==========================================
 export async function invalidateCacheByTmdbId(tmdbId) {
     if (!tmdbId) return;
@@ -786,14 +745,11 @@ export async function invalidateCacheByTmdbId(tmdbId) {
         }
 
         const pipelines = redis.pipeline();
-
-        // 1. 清除根目录和入口分类时间戳 (Critical: 保证入口能刷新)
         pipelines.del(`${PREFIX_LASTMOD}ROOT`);
         pipelines.del(`${PREFIX_LASTMOD}RECENT`);
         const typeKey = series.type === 'movie' ? 'GLOBAL_MOVIE' : 'GLOBAL_TV';
         pipelines.del(`${PREFIX_LASTMOD}${typeKey}`);
         
-        // 2. 清除详情页 (通过反向索引)
         const mappingKey = `dav:mapping:tmdb:${tmdbId}`;
         const relatedCacheKeys = await redis.smembers(mappingKey);
         
@@ -802,15 +758,12 @@ export async function invalidateCacheByTmdbId(tmdbId) {
             pipelines.unlink(mappingKey);
         }
         
-        // 3. 清除该剧集的自身时间戳
         pipelines.del(`${PREFIX_LASTMOD}tmdb:${tmdbId}`);
 
-        // 4. 清除分类列表逻辑 & 分类时间戳
         const targetCategories = [];
         for (const [catName, condition] of Object.entries(CATEGORY_MAP)) {
             let match = true;
             if (condition.type !== series.type) match = false;
-            // 简单的条件匹配逻辑
             if (match && condition.OR) {
                 const langMatch = condition.OR.some(c => c.originalLanguage === series.originalLanguage);
                 if (!langMatch) match = false;
@@ -835,13 +788,8 @@ export async function invalidateCacheByTmdbId(tmdbId) {
         for (const cat of targetCategories) {
             const catPath = `${rootPath}/${cat}`;
             const catHash = crypto.createHash('md5').update(catPath).digest('hex');
-            
-            // (a) 清除分类列表缓存
             pipelines.del(`${PREFIX_LIST}${catHash}`);
-            // (b) 清除分类时间戳
             pipelines.del(`${PREFIX_LASTMOD}${cat}`); 
-            
-            // (c) 清除年份相关的缓存 (因强制折叠，年份目录必存在)
             if (series.year) {
                 const yearPath = `${catPath}/${series.year}`;
                 const yearHash = crypto.createHash('md5').update(yearPath).digest('hex');
@@ -859,7 +807,6 @@ export async function invalidateCacheByTmdbId(tmdbId) {
         const recentHash = crypto.createHash('md5').update(recentPath).digest('hex');
         pipelines.del(`${PREFIX_LIST}${recentHash}`);
 
-        // 5. 清除元数据
         const tmdbStr = String(tmdbId);
         const metaStream = redis.scanStream({ match: `${PREFIX_META}${tmdbStr}:*`, count: 100 });
         metaStream.on('data', keys => { if (keys.length) redis.unlink(keys); });

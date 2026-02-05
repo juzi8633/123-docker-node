@@ -19,19 +19,12 @@ export const cnNums = {'一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'
 export const TMDB_ID_REGEX = /[\[\(\{【]tmdb(?:id)?[\s\-_=+\/:\.]*(\d+)\s*[\]\)\}】]/i;
 
 export function formatSize(bytes) {
-    // [严谨] 强制转为数字，防止传入字符串导致计算错误
     const num = Number(bytes);
     if (num === 0 || isNaN(num)) return '0 B';
-
     const k = 1024;
-    
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
-
-    // 计算索引
     const i = Math.floor(Math.log(num) / Math.log(k));
-
     const safeIndex = Math.min(i, sizes.length - 1);
-
     return parseFloat((num / Math.pow(k, safeIndex)).toFixed(2)) + ' ' + sizes[safeIndex];
 }
 
@@ -232,7 +225,7 @@ export function extractFileInfo(fullPath) {
 
         let parentTitle = extractors.smartCleanTitle(parentDir);
         if (!isInvalidTitle(parentTitle)) {
-            console.log(`[识别修正] 文件名无效(${searchQuery})，回退使用目录名: [${parentTitle}]`);
+            // console.log(`[识别修正] 文件名无效(${searchQuery})，回退使用目录名: [${parentTitle}]`);
             searchQuery = parentTitle;
             chineseName = parentTitle;
             englishName = ""; 
@@ -470,8 +463,6 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
       let videoBaseNameTemplate = ""; 
       if (!isSubtitle) {
           const tags = analysis ? analysis.tagsArray : [];
-          // 移除被否决的标签 (如 DV)，避免文件名出现已被淘汰的特性
-          // 或者保留它们以便 debug，这里选择保留，因为 strm.js 才是最终决定文件名的
           const nameParts = [rawTitle, epNamePart, year, ...tags];
           videoBaseNameTemplate = nameParts.filter(Boolean).join('.');
       }
@@ -491,7 +482,8 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
               source_ref: f.source_ref || '',
               source_type: sourceType,
               type: isSubtitle ? 'subtitle' : 'video',
-              score: finalScore 
+              score: finalScore,
+              S3KeyFlag: f.S3KeyFlag || ''
           },
           score: finalScore 
       });
@@ -509,7 +501,6 @@ export function rebuildJsonWithTmdb(files, info, mediaType, sourceType) {
       if(videos.length > 0) {
           const best = videos[0];
           // 如果最佳版本的得分是 0，说明所有版本都被否决了
-          // 这里我们仍然生成 JSON，但后端会自动处理（跳过或入库等待被覆盖）
           
           const finalName = best.videoBaseNameTemplate + best.ext;
           

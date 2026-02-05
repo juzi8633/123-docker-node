@@ -5,8 +5,7 @@ import { reactive } from 'vue';
 export const globalConfig = reactive({
     tmdbKey: '',
     quarkCookie: '',
-    vipId: '',
-    vipSecret: '',
+    account_vip: '',
     workerAccounts: '',
     open123DirId: '',
     rootFolderId: '',
@@ -26,9 +25,8 @@ export async function initConfig() {
             // 映射数据库 keys 到前端变量
             globalConfig.tmdbKey = d.tmdb_key || '';
             globalConfig.quarkCookie = d.quark_cookie || '';
-            globalConfig.vipId = d.vip_id || '';
-            globalConfig.vipSecret = d.vip_secret || '';
-            globalConfig.workerAccounts = d.worker_accounts || '';
+            globalConfig.account_vip = d.account_vip || '';
+            globalConfig.workerAccounts = d.account_workers || '';
             globalConfig.open123DirId = d.open123_dir_id || '';
             globalConfig.rootFolderId = d.root_folder_id || '';
             globalConfig.cloud189Token = d.cloud189_token || '';

@@ -9,9 +9,8 @@ const isSaving = ref(false)
 const form = ref({
     tmdb_key: '',
     quark_cookie: '',
-    vip_id: '',
-    vip_secret: '',
-    worker_accounts: '',
+    account_vip: '',
+    account_workers: '',
     open123_dir_id: '',
     root_folder_id: '',
     cloud189_token: '', 
@@ -21,9 +20,8 @@ const form = ref({
 onMounted(() => {
     form.value.tmdb_key = globalConfig.tmdbKey || ''
     form.value.quark_cookie = globalConfig.quarkCookie || ''
-    form.value.vip_id = globalConfig.vipId || ''
-    form.value.vip_secret = globalConfig.vipSecret || ''
-    form.value.worker_accounts = globalConfig.workerAccounts || ''
+    form.value.account_vip = globalConfig.account_vip || ''
+    form.value.account_workers = globalConfig.workerAccounts || ''
     form.value.open123_dir_id = globalConfig.open123DirId || ''
     form.value.root_folder_id = globalConfig.rootFolderId || ''
     form.value.cloud189_token = globalConfig.cloud189Token || ''
@@ -41,9 +39,8 @@ const handleSave = async () => {
             configs: {
                 tmdb_key: form.value.tmdb_key,
                 quark_cookie: form.value.quark_cookie,
-                vip_id: form.value.vip_id,
-                vip_secret: form.value.vip_secret,
-                worker_accounts: form.value.worker_accounts,
+                account_vip: form.value.account_vip,
+                account_workers: form.value.account_workers,
                 open123_dir_id: form.value.open123_dir_id,
                 root_folder_id: form.value.root_folder_id,
                 cloud189_token: form.value.cloud189_token,
@@ -110,19 +107,13 @@ const handleSave = async () => {
                     <i class="fa-solid fa-server text-indigo-500"></i>
                     <span class="text-sm font-bold text-slate-700">123网盘 (开放平台)</span>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
-                    <div class="group">
-                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Client ID</label>
-                        <input v-model="form.vip_id" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
-                    </div>
-                    <div class="group">
-                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Client Secret</label>
-                        <input type="password" v-model="form.vip_secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm">
-                    </div>
+                <div class="space-y-1.5">
+                    <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">VIP账号</label>
+                    <textarea v-model="form.account_vip" rows="3" placeholder="ID:Secret,ID:Secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
                 </div>
                 <div class="space-y-1.5">
                     <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">工兵账号池 (Workers)</label>
-                    <textarea v-model="form.worker_accounts" rows="3" placeholder="ID:Secret,ID:Secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
+                    <textarea v-model="form.account_workers" rows="3" placeholder="ID:Secret,ID:Secret" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
                 </div>
                  <div class="grid grid-cols-2 gap-4">
                      <div class="space-y-1.5">
