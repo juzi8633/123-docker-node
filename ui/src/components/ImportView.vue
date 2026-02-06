@@ -280,7 +280,7 @@ const autoMatchSingleItem = async (item, apiKey) => {
     let bestMatch = null
     
     if (directId) {
-        const url = `https://api.themoviedb.org/3/${type}/${directId}?api_key=${apiKey}&language=zh-CN`
+        const url = `https://api.tmdb.org/3/${type}/${directId}?api_key=${apiKey}&language=zh-CN`
         const res = await fetch(url)
         if (res.ok) {
             bestMatch = await res.json()
@@ -294,7 +294,7 @@ const autoMatchSingleItem = async (item, apiKey) => {
         const targetYear = item.year 
         
         const yearParam = targetYear ? `&${type === 'movie' ? 'primary_release_year' : 'first_air_date_year'}=${targetYear}` : ''
-        let url = `https://api.themoviedb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN${yearParam}`
+        let url = `https://api.tmdb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN${yearParam}`
         
         let res = await fetch(url)
         let data = await res.json()
@@ -302,7 +302,7 @@ const autoMatchSingleItem = async (item, apiKey) => {
         bestMatch = findBestMatch(candidates, targetYear)
 
         if (!bestMatch && targetYear) {
-           url = `https://api.themoviedb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN`
+           url = `https://api.tmdb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN`
            res = await fetch(url)
            data = await res.json()
            candidates = data.results || []
@@ -381,7 +381,7 @@ const searchTmdbManual = async () => {
   
   try {
     const q = encodeURIComponent(tmdbSearchQuery.value)
-    const res = await fetch(`https://api.themoviedb.org/3/search/multi?api_key=${apiKey}&query=${q}&language=zh-CN`)
+    const res = await fetch(`https://api.tmdb.org/3/search/multi?api_key=${apiKey}&query=${q}&language=zh-CN`)
     const data = await res.json()
     tmdbDropdownList.value = (data.results || []).filter(i => i.media_type !== 'person')
   } catch(e) {

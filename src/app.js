@@ -676,7 +676,7 @@ async function fetchTmdbMeta(id, type) {
     const cacheKey = `tmdb:${type}:${id}`;
     if (metaCache.has(cacheKey)) return metaCache.get(cacheKey);
     try {
-        const res = await fetch(`https://api.themoviedb.org/3/${type}/${id}?api_key=${apiKey}&language=zh-CN`);
+        const res = await fetch(`https://api.tmdb.org/3/${type}/${id}?api_key=${apiKey}&language=zh-CN`);
         if (res.ok) {
             const data = await res.json();
             metaCache.set(cacheKey, data);
