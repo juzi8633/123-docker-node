@@ -320,7 +320,6 @@ export class Web123Client {
 
 
     async getDownloadUrl(fileMeta, customUa = null) {
-        let fileMeta = {};
         const downloadInfoPayload = {
             Etag: fileMeta.etag,
             Size: fileMeta.size,
