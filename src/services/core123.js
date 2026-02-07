@@ -157,6 +157,25 @@ export class Core123Service {
     // 3. 执行请求
     const task = (async () => {
         try {
+            if (!S3KeyFlag) {
+                const probeResult = await this.probeFileByHash(filename, etag, size); // 使用 Worker 账号
+                if (!probeResult || !probeResult.S3KeyFlag) {
+                    throw new Error("文件不存在或探测失败");
+                }
+                if (probeResult && probeResult.S3KeyFlag) {
+                    S3KeyFlag = probeResult.S3KeyFlag;
+
+                    // 4. 【异步更新数据库】将探测到的 S3KeyFlag 持久化，下次请求直接走 VIP
+                    prisma.seriesEpisode.updateMany({
+                      where: { etag: etag },
+                      data: { S3KeyFlag: S3KeyFlag }
+                    }).then(res => {
+                      logger.info({ etag, count: res.count }, `💾 [DB] S3KeyFlag 已回填数据库`);
+                    }).catch(err => {
+                      logger.warn({ err: err.message }, `⚠️ [DB] S3KeyFlag 回填失败`);
+                    });
+                }
+            }
             const client = await this.getVipClient();
             const url = await client.getDownloadUrl({
                 etag, size: Number(size), filename, S3KeyFlag
@@ -187,7 +206,7 @@ export class Core123Service {
           const client = await this.getWorkerClient();
           const safeName = filename.replace(/[\\/:*?"<>|]/g, "_").substring(0, 255);
           const fileMeta = {
-              fileName: safeName, size: Number(size), duplicate: 2, etag, type: 0
+              fileName: '.tempfile', size: Number(size), duplicate: 2, etag, type: 0
           };
 
           await new Promise(r => setTimeout(r, 1000)); // 简易限流
