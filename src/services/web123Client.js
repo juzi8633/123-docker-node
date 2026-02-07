@@ -319,51 +319,12 @@ export class Web123Client {
     }
 
 
-    async getDownloadUrl(input, customUa = null) {
+    async getDownloadUrl(fileMeta, customUa = null) {
         let fileMeta = {};
-        if (typeof input === 'string' || typeof input === 'number') {
-            const infoResp = await this.fsInfo(input);
-            const list = infoResp.data.infoList || infoResp.data.InfoList;
-            if (!list || list.length === 0) throw new Error(`文件 ID ${input} 未找到`);
-            const info = list[0];
-            fileMeta = {
-                etag: info.Etag,
-                size: info.Size,
-                filename: info.FileName,
-                fileId: info.FileId,
-                s3KeyFlag: info.S3KeyFlag
-            };
-        } else {
-            fileMeta = input;
-        }
-
-        let s3KeyFlag = fileMeta.s3KeyFlag;
-
-        // [补全] 只有在缺失 s3KeyFlag 时才进行探测
-        if (!s3KeyFlag) {
-            const probePayload = {
-                fileName: ".tempfile_probe",
-                duplicate: 2, // 2: 探测模式
-                etag: fileMeta.etag,
-                size: fileMeta.size,
-                type: 0
-            };
-            try {
-                const probeResp = await this.uploadRequest(probePayload);
-                if (!probeResp.data.Reuse) {
-                    throw new Error("无法获取 S3KeyFlag: 文件未在云端找到");
-                }
-                s3KeyFlag = probeResp.data.Info.S3KeyFlag;
-            } catch (e) {
-                logger.warn({ err: e.message, etag: fileMeta.etag }, `⚠️ [Link] S3KeyFlag 探测失败`);
-                throw e;
-            }
-        }
-
         const downloadInfoPayload = {
             Etag: fileMeta.etag,
             Size: fileMeta.size,
-            S3KeyFlag: s3KeyFlag,
+            S3KeyFlag: fileMeta.S3KeyFlag,
             FileName: fileMeta.filename || String(fileMeta.etag),
             FileID: fileMeta.fileId || 0,
             driveId: 0,

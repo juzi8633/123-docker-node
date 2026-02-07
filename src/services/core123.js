@@ -157,28 +157,31 @@ export class Core123Service {
     // 3. 执行请求
     const task = (async () => {
         try {
-            if (!S3KeyFlag) {
+            let targetS3Key = S3KeyFlag;
+            if (!targetS3Key) {
                 const probeResult = await this.probeFileByHash(filename, etag, size); // 使用 Worker 账号
                 if (!probeResult || !probeResult.S3KeyFlag) {
                     throw new Error("文件不存在或探测失败");
                 }
                 if (probeResult && probeResult.S3KeyFlag) {
-                    S3KeyFlag = probeResult.S3KeyFlag;
+                    targetS3Key = probeResult.S3KeyFlag;
 
                     // 4. 【异步更新数据库】将探测到的 S3KeyFlag 持久化，下次请求直接走 VIP
                     prisma.seriesEpisode.updateMany({
                       where: { etag: etag },
-                      data: { S3KeyFlag: S3KeyFlag }
+                      data: { S3KeyFlag: targetS3Key }
                     }).then(res => {
                       logger.info({ etag, count: res.count }, `💾 [DB] S3KeyFlag 已回填数据库`);
                     }).catch(err => {
                       logger.warn({ err: err.message }, `⚠️ [DB] S3KeyFlag 回填失败`);
                     });
                 }
+                logger.info({ targetS3Key }, `✅ 普通账号获取直链`);
             }
             const client = await this.getVipClient();
+
             const url = await client.getDownloadUrl({
-                etag, size: Number(size), filename, S3KeyFlag
+                etag, size: Number(size), filename, S3KeyFlag: targetS3Key
             }, userAgent);
             
             if (url) {
