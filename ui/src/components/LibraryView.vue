@@ -132,32 +132,35 @@ const toggleDetail = async (id) => {
 }
 
 const copySeriesJson = async (id) => {
-  const data = detailCache[id]
-  if(!data) return
+  const data = detailCache[id];
+  if (!data) return;
 
-  const rawTitle = data.info.name.replace(/[\\/:*?"<>|]/g, '').trim()
-  const year = data.info.year
-  const commonPath = `${rawTitle} (${year}) {tmdbid-${data.info.tmdbId}}/`
-  const isTV = data.episodes.some(ep => ep.season > 1 || ep.episode > 1)
+  const tmdbId = data.info.tmdbId;
+  const mediaType = data.info.type;
 
-  const files = data.episodes.map(ep => {
-    if(isTV) {
-      const seasonFolder = `Season ${String(ep.season).padStart(2,'0')}`
-      return { path: `${seasonFolder}/${ep.cleanName}`, etag: ep.etag, size: ep.size }
-    } else {
-      return { path: `${ep.cleanName}`, etag: ep.etag, size: ep.size }
-    }
-  })
+  // 严格映射字段名与格式
+  const items = data.episodes.map(ep => ({
+    tmdbId: tmdbId,
+    mediaType: mediaType,
+    season: ep.season,
+    episode: ep.episode,
+    fileType: ep.type || "video",
+    cleanName: ep.cleanName,
+    size: String(ep.size),
+    etag: ep.etag,
+    s3KeyFlag: ep.S3KeyFlag || "", // 确保 null 变为 ""
+    score: ep.score
+  }));
 
-  const json = { scriptVersion: "3.0.3", exportVersion: "1.0", usesBase62EtagsInExport: false, commonPath, files, totalFilesCount: files.length, totalSize: files.reduce((a,b)=>a+b.size, 0) }
-  
   try {
-    await navigator.clipboard.writeText(JSON.stringify(json, null, 2))
-    showToast("已复制到剪贴板", "success")
-  } catch(err) {
-    showToast("复制失败", "error")
+    // 导出格式：{"items": [...]}
+    const json = { items }; 
+    await navigator.clipboard.writeText(JSON.stringify(json, null, 2));
+    showToast("已复制 items 格式数据", "success");
+  } catch (err) {
+    showToast("复制失败", "error");
   }
-}
+};
 
 // [核心修改] 删除整个剧集 - 使用 GlobalConfirm
 const deleteSeries = async (id, name) => {

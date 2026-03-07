@@ -5,14 +5,9 @@ import { Readable } from 'stream';
 import path from 'path'; 
 import { fileURLToPath } from 'url'; 
 import fastifyStatic from '@fastify/static'; 
-import fs from 'fs'; 
-import crypto from 'node:crypto'; 
 
 // [优化] 引入压缩插件，解决 XML 传输瓶颈
 import fastifyCompress from '@fastify/compress'; 
-
-// [修改] 引入新的精准清除函数 invalidateCacheByTmdbId
-import { handleWebDavRequest, invalidateWebdavCache, invalidateCacheByTmdbId } from './webdav.js';
 
 // 引入核心模块
 import { addToQueue } from './queue.js';
@@ -74,12 +69,6 @@ app.register(fastifyStatic, {
     wildcard: false 
 });
 
-// [新增] WebDAV 路由
-app.all('/webdav/*', {
-    disableRequestLogging: true
-}, async (req, reply) => {
-    return handleWebDavRequest(req, reply);
-});
 
 const SECRET = process.env.SECRET;
 
@@ -111,22 +100,30 @@ app.addHook('onReady', async () => {
     }
 });
 
-app.addHook('onRequest', async (req, reply) => {
+// [优化] 将 onRequest 改为 preHandler，以便在 Fastify 生命周期中能正确读取到 req.body
+app.addHook('preHandler', async (req, reply) => {
     const url = req.raw.url;
-    // 白名单放行逻辑（保持不变）
-    if (url.startsWith('/api/webhook/upload') || 
-        url.startsWith('/api/webhook/emby') || 
+    // 白名单放行逻辑（移除了 webhook/upload，由下方统一鉴权）
+    if (url.startsWith('/api/webhook/emby') || 
         url.startsWith('/api/stream') || 
         url === '/' || 
         url.includes('/assets/') || 
-        url.startsWith('/webdav') || 
         url === '/favicon.ico') return;
 
-    // 修复后的鉴权逻辑
-    if (SECRET && url.startsWith('/api') && req.headers['authorization'] !== SECRET) {
-        // 🚨 必须在这里发送响应来拦截请求
-        return reply.code(401).send({ error: 'Unauthorized: Invalid Secret' });
+    // 修复后的鉴权逻辑（聚合 Header, Query 和 Body 鉴权）
+    if (SECRET && url.startsWith('/api')) {
+        const providedSecret = req.headers['authorization'] || (req.query && req.query.key) || (req.body && req.body.secret);
+        if (providedSecret !== SECRET) {
+            // 🚨 必须在这里发送响应来拦截请求
+            return reply.code(401).send({ error: 'Unauthorized: Invalid Secret' });
+        }
     }
+});
+
+// [新增] 全局错误处理器，代替纯查询接口内的 try-catch
+app.setErrorHandler((error, request, reply) => {
+    request.log.error(error);
+    reply.status(500).send({ success: false, error: error.message });
 });
 
 app.get('/api/health', async (req, reply) => {
@@ -177,31 +174,31 @@ app.get('/api/search', {
     const skip = (parseInt(page) - 1) * parseInt(size);
     const take = parseInt(size);
     const where = q ? { OR: [ { name: { contains: q } }, ...( !isNaN(q) ? [{ tmdbId: parseInt(q) }] : []) ] } : {};
-    try {
-        const [total, list] = await prisma.$transaction([
-            prisma.seriesMain.count({ where: { ...where, episodes: { some: {} } } }),
-            prisma.seriesMain.findMany({
-                where: { ...where, episodes: { some: {} } },
-                take, skip, orderBy: { lastUpdated: 'desc' },
-                select: { tmdbId: true, name: true, year: true, type: true, genres: true, originalLanguage: true, originCountry: true, lastUpdated: true }
-            })
-        ]);
-        return { total, list, page: parseInt(page), size: take };
-    } catch (e) { return reply.code(500).send({ error: e.message }); }
+    
+    // 移除了 try-catch，由全局 Error Handler 捕获
+    const [total, list] = await prisma.$transaction([
+        prisma.seriesMain.count({ where: { ...where, episodes: { some: {} } } }),
+        prisma.seriesMain.findMany({
+            where: { ...where, episodes: { some: {} } },
+            take, skip, orderBy: { lastUpdated: 'desc' },
+            select: { tmdbId: true, name: true, year: true, type: true, genres: true, originalLanguage: true, originCountry: true, lastUpdated: true }
+        })
+    ]);
+    return { total, list, page: parseInt(page), size: take };
 });
 
 app.get('/api/details', async (req, reply) => {
     const id = parseInt(req.query.id);
     if (!id || isNaN(id)) return { error: "No ID provided" };
-    try {
-        const seriesInfo = await prisma.seriesMain.findUnique({ where: { tmdbId: id } });
-        if (!seriesInfo) return { error: "Series not found" };
-        const episodes = await prisma.seriesEpisode.findMany({
-            where: { tmdbId: id },
-            orderBy: [{ season: 'asc' }, { episode: 'asc' }, { type: 'desc' }]
-        });
-        return { info: seriesInfo, episodes };
-    } catch (e) { return reply.code(500).send({ error: e.message }); }
+    
+    // 移除了 try-catch，由全局 Error Handler 捕获
+    const seriesInfo = await prisma.seriesMain.findUnique({ where: { tmdbId: id } });
+    if (!seriesInfo) return { error: "Series not found" };
+    const episodes = await prisma.seriesEpisode.findMany({
+        where: { tmdbId: id },
+        orderBy: [{ season: 'asc' }, { episode: 'asc' }, { type: 'desc' }]
+    });
+    return { info: seriesInfo, episodes };
 });
 
 app.get('/api/pending/list', async (req, reply) => {
@@ -230,13 +227,12 @@ app.get('/api/pending/list', async (req, reply) => {
         };
     }
 
-    try {
-        const [total, list] = await prisma.$transaction([
-            prisma.pendingEpisode.count({ where }),
-            prisma.pendingEpisode.findMany({ where, take, skip, orderBy: { createdAt: 'desc' } })
-        ]);
-        return { total, list };
-    } catch (e) { return reply.code(500).send({ error: e.message }); }
+    // 移除了 try-catch，由全局 Error Handler 捕获
+    const [total, list] = await prisma.$transaction([
+        prisma.pendingEpisode.count({ where }),
+        prisma.pendingEpisode.findMany({ where, take, skip, orderBy: { createdAt: 'desc' } })
+    ]);
+    return { total, list };
 });
 
 app.post('/api/pending/delete', async (req, reply) => {
@@ -249,11 +245,10 @@ app.post('/api/pending/delete', async (req, reply) => {
 });
 
 app.get('/api/config', async (req, reply) => {
-    try {
-        const configs = await prisma.systemConfig.findMany();
-        const data = configs.reduce((acc, cur) => ({ ...acc, [cur.key]: cur.value }), {});
-        return { success: true, data };
-    } catch (e) { return reply.code(500).send({ success: false, message: e.message }); }
+    // 移除了 try-catch，由全局 Error Handler 捕获
+    const configs = await prisma.systemConfig.findMany();
+    const data = configs.reduce((acc, cur) => ({ ...acc, [cur.key]: cur.value }), {});
+    return { success: true, data };
 });
 
 app.post('/api/config', async (req, reply) => {
@@ -305,17 +300,6 @@ app.post('/api/config', async (req, reply) => {
 });
 
 
-app.get('/api/offline/progress', async (req, reply) => {
-    const taskID = req.query.taskID;
-    const token = await core123.getVipToken(); 
-    if(!taskID || !token) return { code: 1, message: "Missing params" };
-    try {
-        const res = await fetch(`https://open-api.123pan.com/api/v1/offline/download/process?taskID=${taskID}`, {
-            headers: { 'Authorization': `Bearer ${token}`, 'Platform': 'open_platform' }
-        });
-        return await res.json();
-    } catch(e) { return { code: 1, message: e.message }; }
-});
 
 app.post('/api/admin/clear-db', async (req, reply) => {
     logger.warn('[Admin] ⚠️ 收到清空媒体库请求 (Clear DB)...');
@@ -328,7 +312,6 @@ app.post('/api/admin/clear-db', async (req, reply) => {
         logger.info({ epCount: epCount.count, mainCount: mainCount.count }, '[Admin] ✅ 数据库媒体表已清空');
         
         metaCache.clear();
-        invalidateWebdavCache(); 
 
         return { 
             success: true, 
@@ -500,12 +483,6 @@ app.post('/api/submit', async (req, reply) => {
 
         logger.info('[Submit] ✅ 数据库写入完成，开始后续处理...');
 
-        if (tmdbId) {
-            // [修改] 确保调用正确的清理函数，使 WebDAV 立即生效
-            invalidateCacheByTmdbId(tmdbId).catch(err => logger.warn({ tmdbId, err }, 'Cache invalidation failed'));
-        } else {
-            invalidateWebdavCache(); 
-        }
 
         return { success: true, pendingCount: isSourceTrusted ? 0 : pendingCount };
 
@@ -524,12 +501,6 @@ app.delete('/api/delete/series', async (req, reply) => {
         prisma.seriesMain.deleteMany({ where: { tmdbId: id } }) 
     ]);
 
-    if (id) {
-        await invalidateCacheByTmdbId(id);
-    } else {
-        invalidateWebdavCache();
-    }
-
     return { success: true, id };
 });
 
@@ -545,20 +516,15 @@ app.delete('/api/delete/episode', async (req, reply) => {
         await prisma.seriesEpisode.delete({ where: { id } });
     }
 
-    if (tmdbId) {
-        await invalidateCacheByTmdbId(tmdbId);
-    } else {
-        invalidateWebdavCache();
-    }
 
     return { success: true, id };
 });
 
 app.post('/api/webhook/upload', async (req, reply) => {
     const { secret, file_name, path, etag, size, s3_key_flag='' } = req.body;
-    logger.info({ file_name, size }, `[Webhook] 收到上传通知`);
+    logger.info({ secret, file_name, path, etag, size, s3_key_flag }, `[Webhook] 收到上传通知`);
     
-    if (secret !== SECRET) return reply.code(403).send({ error: 'Invalid Secret' });
+    // 移除了局部的 secret 校验，由统一鉴权处理
     if (!file_name || !etag) return { status: 'error', message: 'Missing fields' };
     const tmdbMatch = file_name.match(RE_TMDB_TAG) || path.match(RE_TMDB_TAG);
     if (!tmdbMatch) return { status: 'error', message: 'Missing {tmdb=xxx} tag' };
@@ -615,11 +581,6 @@ app.post('/api/webhook/upload', async (req, reply) => {
         id: -1, cleanName: standardizedName, type: 'verify_rapid', etag, size, tmdbId, season, episode, score: newScore, sourceType: 'webhook'
     });
 
-    if (tmdbId) {
-        await invalidateCacheByTmdbId(tmdbId);
-    } else {
-        invalidateWebdavCache();
-    }
 
     return { status: 'ok', new_name: standardizedName };
 });
@@ -654,8 +615,8 @@ app.get('/api/stream', async (req, reply) => {
 });
 
 app.post('/api/callback/123', async (req, reply) => {
-    const { id, key } = req.query;
-    if (key !== SECRET) return reply.code(403).send("Forbidden");
+    const { id } = req.query;
+    // 移除了局部的 secret 校验，由统一鉴权处理
     const body = req.body;
     logger.info({ id, status: body.status }, `[Callback] 收到 123 离线下载回调`);
     await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
@@ -693,7 +654,7 @@ function parseSeasonEpisode(name, type) {
 }
 
 app.setNotFoundHandler((req, reply) => {
-    if (req.raw.url.startsWith('/api') || req.raw.url.startsWith('/webdav')) {
+    if (req.raw.url.startsWith('/api')) {
         reply.code(404).send({ error: 'API/WebDAV Not Found' });
     } else {
         reply.sendFile('index.html');

@@ -322,7 +322,7 @@ export function autoGroupFiles(rawFilesData) {
             const fileName = f.path.split('/').pop();
             const parent = f.path.split('/').length >= 2 ? f.path.split('/')[f.path.split('/').length - 2] : "";
             
-            let season = parseSeason(fileName) || parseSeason(parent) || 1;
+            let season = parseSeason(fileName) || parseSeason(parent) || 0;
             let epStr = "?";
             const ep = parseEpisode(fileName);
             if (ep !== null) {

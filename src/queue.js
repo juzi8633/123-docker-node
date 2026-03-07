@@ -5,7 +5,6 @@ import { prisma } from './db.js';
 import redis, { REDIS_CONNECTION_CONFIG } from './redis.js';
 import { createHash } from 'crypto';
 import { createLogger } from './logger.js';
-import { invalidateCacheByTmdbId } from './webdav.js';
 
 const logger = createLogger('Queue');
 
@@ -113,9 +112,7 @@ const worker = new Worker('download-queue', async (job) => {
         if (rowId > 0) ops.push(prisma.pendingEpisode.delete({ where: { id: rowId } }));
 
         await prisma.$transaction(ops);
-        logger.info({ taskName }, `✅ 秒传成功`);
-        
-        try { if (task.tmdbId) await invalidateCacheByTmdbId(task.tmdbId); } catch (e) {}
+        logger.info({ taskName }, `✅ 秒传成功`)
         await redis.del(LOCK_KEY);
         return { status: 'rapid_success' };
     }
@@ -147,7 +144,6 @@ const worker = new Worker('download-queue', async (job) => {
         });
     }
 
-    try { if (task.tmdbId) await invalidateCacheByTmdbId(task.tmdbId); } catch (e) {}
     
     logger.info({ taskId: offlineData.taskID }, `🚀 离线任务已提交`);
     await redis.del(LOCK_KEY);
