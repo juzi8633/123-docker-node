@@ -62,33 +62,42 @@ export function parseSeason(text) {
     return 0;
 }
 
-export function parseEpisode(text) {
-    if (!text) return null;
-    const strictPatterns = [
-        /[Ee][Pp]?(\d+)/,
-        /S\d+[Ee](\d+)/i,
-        /第([0-9一二三四五六七八九十两〇零]+)[集话]/,
-        /\[(\d{1,3})\]/,
-        / - (\d{1,3}) (?:\[|t|v|\.)/,
-        /(?:^|[^\d])(?:EP?|第)?(\d{1,3})(?:END|FIN|V\d+)?(?:[^\d]|$)/i
+export function parseEpisodeDetail(text) {
+    if (!text) return { value: null, confidence: 'none', source: 'none' };
+
+    const strongPatterns = [
+        { regex: /S\d+[Ee](\d+)/i, source: 'sxe' },
+        { regex: /[Ee][Pp]?(\d+)/, source: 'ep' },
+        { regex: /第([0-9一二三四五六七八九十两〇零]+)[集话]/, source: 'chinese-episode' },
+        { regex: /\[(\d{1,3})\]/, source: 'bracket' },
+        { regex: / - (\d{1,3}) (?:\[|t|v|\.)/, source: 'delimited-number' },
+        { regex: /(?:^|[^\d])(?:EP?|第)?(\d{1,3})(?:END|FIN|V\d+)?(?:[^\d]|$)/i, source: 'generic-episode' }
     ];
-    for (const p of strictPatterns) {
-        const m = text.match(p);
-        if (m) {
-            return /^\d+$/.test(m[1]) ? parseInt(m[1]) : cnToInt(m[1]);
+
+    for (const pattern of strongPatterns) {
+        const match = text.match(pattern.regex);
+        if (match) {
+            const value = /^\d+$/.test(match[1]) ? parseInt(match[1]) : cnToInt(match[1]);
+            return { value, confidence: 'strong', source: pattern.source };
         }
     }
+
     const nameWithoutExt = text.replace(/\.[^/.]+$/, "");
     const looseMatch = nameWithoutExt.match(/^(\d{1,3})(?:[\s\._\-]|$)/);
     if (looseMatch) {
         const num = parseInt(looseMatch[1]);
         const currentYear = new Date().getFullYear();
         if (num > 1888 && num <= currentYear + 2) {
-            return null;
+            return { value: null, confidence: 'none', source: 'none' };
         }
-        return num;
+        return { value: num, confidence: 'weak', source: 'leading-number' };
     }
-    return null;
+
+    return { value: null, confidence: 'none', source: 'none' };
+}
+
+export function parseEpisode(text) {
+    return parseEpisodeDetail(text).value;
 }
 
 const DATE_REGEX = /(?:20\d{2}[-_\.]\d{1,2}[-_\.]\d{1,2})|(?:20\d{6})/;
@@ -250,7 +259,15 @@ export function extractFileInfo(fullPath) {
     chineseName = chineseName.replace(/[\.\s]+$/, '');
     englishName = englishName.replace(/[\.\s]+$/, '');
     
+    const normalizeSearchQuery = (text) => String(text || '')
+        .replace(/[·・]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
     let searchQuery = englishName && englishName.length >= 2 ? englishName : chineseName;
+    let fallbackSearchQuery = '';
+    let searchQuerySource = englishName && englishName.length >= 2 ? 'file-english' : 'file-chinese';
+    const fileDerivedSearchQuery = normalizeSearchQuery(searchQuery);
 
     const isInvalidTitle = (t) => {
         return !t || 
@@ -267,24 +284,45 @@ export function extractFileInfo(fullPath) {
             candidateDir = candidateDir.replace(TMDB_ID_REGEX, '');
             const parentTitle = extractors.smartCleanTitle(candidateDir);
             if (!isInvalidTitle(parentTitle)) {
+                const normalizedParentTitle = normalizeSearchQuery(parentTitle);
+                if (!isInvalidTitle(fileDerivedSearchQuery) && fileDerivedSearchQuery !== normalizedParentTitle) {
+                    fallbackSearchQuery = fileDerivedSearchQuery;
+                }
                 searchQuery = parentTitle;
+                searchQuerySource = 'parent-dir';
                 chineseName = parentTitle;
                 englishName = "";
                 break;
             }
         }
+    } else {
+        const seasonFolderRegex = /^(Season\s*\d+|S\d+|Specials|第[一二三四五六七八九十0-9]+季)$/i;
+        for (let i = parts.length - 2; i >= Math.max(0, parts.length - 4); i--) {
+            let candidateDir = parts[i];
+            if (seasonFolderRegex.test(candidateDir)) continue;
+            candidateDir = candidateDir.replace(TMDB_ID_REGEX, '');
+            const parentTitle = extractors.smartCleanTitle(candidateDir);
+            if (!isInvalidTitle(parentTitle)) {
+                const normalizedParentTitle = normalizeSearchQuery(parentTitle);
+                if (normalizedParentTitle && normalizedParentTitle !== fileDerivedSearchQuery) {
+                    fallbackSearchQuery = normalizedParentTitle;
+                }
+                break;
+            }
+        }
     }
 
-    searchQuery = searchQuery
-        .replace(/[·・]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    searchQuery = normalizeSearchQuery(searchQuery);
+    fallbackSearchQuery = normalizeSearchQuery(fallbackSearchQuery);
 
-    const epNum = parseEpisode(fileName);
+    const episodeInfo = parseEpisodeDetail(fileName);
+    const epNum = episodeInfo.value;
     const seasonNum = parseSeason(fileName) || parseSeason(parts[parts.length - 2] || '');
     const isVariety = /第\d+期/.test(fileName) || /先导片|特别篇|特典/.test(fileName);
     const hasSeasonFolder = /Season\s*\d+/i.test(normalizedPath) || /第[一二三四五六七八九十0-9]+季/.test(normalizedPath);
-    const isTV = isVariety || epNum !== null || seasonNum > 0 || hasSeasonFolder;
+    const hasStrongEpisode = episodeInfo.confidence === 'strong';
+    const hasWeakEpisode = episodeInfo.confidence === 'weak';
+    const isTV = isVariety || hasStrongEpisode || seasonNum > 0 || hasSeasonFolder || (hasWeakEpisode && (seasonNum > 0 || hasSeasonFolder));
 
     return {
         originalName: fileName,
@@ -293,7 +331,9 @@ export function extractFileInfo(fullPath) {
         tmdbId: tmdbId,
         chineseName: chineseName,
         englishName: englishName,
-        searchQuery: searchQuery, 
+        searchQuery: searchQuery,
+        fallbackSearchQuery: fallbackSearchQuery,
+        searchQuerySource: searchQuerySource,
         isTV: isTV
     };
 }
@@ -340,9 +380,11 @@ export function autoGroupFiles(rawFilesData) {
         if (!groups[groupKey]) {
             groups[groupKey] = {
                 key: groupKey,
-                searchQuery: info.searchQuery, 
+                searchQuery: info.searchQuery,
+                fallbackSearchQuery: info.fallbackSearchQuery || '',
+                searchQuerySource: info.searchQuerySource || 'file-chinese',
                 year: info.year,
-                tmdbId: info.tmdbId, 
+                tmdbId: info.tmdbId,
                 isTV: info.isTV,
                 files: []
             };
@@ -374,8 +416,10 @@ export function autoGroupFiles(rawFilesData) {
             
             let season = parseSeason(fileName) || parseSeason(parent) || 0;
             let epStr = "?";
-            const ep = parseEpisode(fileName);
-            if (ep !== null) {
+            const episodeInfo = parseEpisodeDetail(fileName);
+            const ep = episodeInfo.value;
+            const canUseEpisode = episodeInfo.confidence === 'strong' || (episodeInfo.confidence === 'weak' && season > 0);
+            if (ep !== null && canUseEpisode) {
                 epStr = `S${String(season).padStart(2,'0')}E${String(ep).padStart(2,'0')}`;
             }
             f._previewSeason = season;

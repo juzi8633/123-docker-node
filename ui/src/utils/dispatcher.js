@@ -6,27 +6,25 @@ import { showToast } from './toast.js'
 
 /**
  * 启动后台处理流水线
- * @param {Array} selectedFiles - 包含文件信息的数组 {id, clean_name, etag, size, url, ...}
+ * @param {Array} selectedFiles - 包含任务行数据的数组，优先使用 camelCase 字段（兼容旧 snake_case）
  */
 export async function dispatchToBackground(selectedFiles) {
     if (!selectedFiles || selectedFiles.length === 0) return false;
 
-    // 1. 组装任务 Payload
     const tasks = selectedFiles.map(f => ({
         id: f.id,
-        name: f.clean_name,
+        cleanName: f.cleanName || f.clean_name || '',
         etag: f.etag,
         size: f.size,
         url: f.url || '', // 泛用字段，保留以支持其他可能的 URL 导入
-        source_type: f.source_type, // '189', 'quark'
-        source_ref: f.source_ref    // 'fileId|shareId'
+        sourceType: f.sourceType || f.source_type || '',
+        sourceRef: f.sourceRef || f.source_ref || ''
     }));
 
     // [修改] 不再从前端收集凭证，后端 Worker 会自动从数据库读取配置
     // const authConfig = { ... } <- 已移除
 
     try {
-        // 2. 发送给后端 API
         const res = await fetch('/api/do/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

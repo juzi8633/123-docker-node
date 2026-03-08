@@ -3,9 +3,9 @@ import { ref, onMounted, computed } from 'vue'
 import ConfigPanel from './components/ConfigPanel.vue'
 import LibraryView from './components/LibraryView.vue'
 import ImportView from './components/ImportView.vue'
+import VerificationView from './components/VerificationView.vue'
 import GlobalConfirm from './components/GlobalConfirm.vue'
 import GlobalToast from './components/GlobalToast.vue'
-// 新增引入
 import LoginView from './components/LoginView.vue'
 
 import { initConfig, globalConfig } from './utils/configStore.js'
@@ -82,6 +82,12 @@ const onLoginSuccess = async () => {
 const switchTab = (tab) => {
   currentTab.value = tab
 }
+
+const currentView = computed(() => {
+  if (currentTab.value === 'library') return LibraryView
+  if (currentTab.value === 'import') return ImportView
+  return VerificationView
+})
 
 onMounted(async () => {
     // 1. 检查本地是否有 Token
@@ -181,13 +187,21 @@ onMounted(async () => {
                 <i class="fa-solid fa-cloud-arrow-up" :class="{'animate-bounce-subtle': currentTab === 'import'}"></i> 导入资源
                 </button>
 
+                <button @click="switchTab('verification')" 
+                class="relative px-5 py-2.5 rounded-lg text-sm font-bold transition-all duration-200 flex items-center gap-2 flex-shrink-0 select-none outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                :class="currentTab === 'verification' 
+                    ? 'bg-white text-indigo-600 shadow-sm ring-1 ring-black/5 scale-[1.02]' 
+                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'">
+                <i class="fa-solid fa-list-check" :class="{'animate-bounce-subtle': currentTab === 'verification'}"></i> 任务与验证
+                </button>
+
             </div>
             </div>
 
             <div class="p-6 flex-1 relative min-h-0 overflow-hidden flex flex-col">
             <Transition name="fade-slide" mode="out-in">
                 <KeepAlive>
-                <component :is="currentTab === 'library' ? LibraryView : ImportView" />
+                <component :is="currentView" />
                 </KeepAlive>
             </Transition>
             </div>

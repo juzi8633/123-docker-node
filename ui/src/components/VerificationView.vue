@@ -6,7 +6,7 @@ import { showToast } from '../utils/toast.js'
 import { showConfirm } from '../utils/dialog.js'
 
 // =========================
-// 逻辑状态 (保持不变)
+// 任务列表状态
 // =========================
 const fullList = ref([]) 
 const totalItems = ref(0) 
@@ -14,9 +14,14 @@ const selectedIds = ref(new Set())
 const isLoading = ref(false)
 
 // 筛选与分页
-const currentFilter = ref('pending') // pending, downloading, failed
+const currentFilter = ref('pending') // pending, processing, failed
 const currentPage = ref(1)
 const pageSize = ref(parseInt(localStorage.getItem('pending_page_size') || '20'))
+const filterTabs = [
+    { key: 'pending', icon: 'fa-regular fa-clock', label: '待处理', activeClass: 'bg-white text-indigo-600 shadow-sm ring-1 ring-black/5' },
+    { key: 'processing', icon: 'fa-solid fa-gears', label: '处理中', activeClass: 'bg-white text-blue-600 shadow-sm ring-1 ring-black/5' },
+    { key: 'failed', icon: 'fa-solid fa-circle-exclamation', label: '已失败', activeClass: 'bg-white text-red-500 shadow-sm ring-1 ring-black/5' }
+]
 
 // 自动刷新逻辑
 let autoRefreshTimer = null
@@ -121,13 +126,23 @@ const deleteSelected = async () => {
 
 const retrySelected = async () => {
     if (selectedIds.value.size === 0) return
-    // 提取选中项的完整信息
     const items = fullList.value.filter(i => selectedIds.value.has(i.id))
     const success = await dispatchToBackground(items)
     if (success) {
-        // 等待一会刷新
         setTimeout(fetchList, 1000)
     }
+}
+
+const getFilterBadgeClass = (filter) => {
+    if (filter === 'processing') return 'bg-blue-50 text-blue-600 border-blue-100'
+    if (filter === 'failed') return 'bg-red-50 text-red-500 border-red-100'
+    return 'bg-slate-100 text-slate-500 border-slate-200'
+}
+
+const getFilterStatusText = (filter, item) => {
+    if (filter === 'processing') return '校验处理中'
+    if (filter === 'failed') return `重试: ${item.retryCount}`
+    return '等待调度'
 }
 
 // 分页
@@ -157,20 +172,10 @@ watch(currentFilter, () => {
       <div class="bg-white/80 backdrop-blur-xl p-3 rounded-2xl shadow-lg shadow-slate-200/50 border border-white/60 flex flex-wrap justify-between items-center gap-3 transition-all duration-300">
           
           <div class="flex bg-slate-100/80 p-1 rounded-xl border border-slate-200/50">
-              <button @click="changeFilter('pending')" 
+              <button v-for="tab in filterTabs" :key="tab.key" @click="changeFilter(tab.key)"
                 class="px-4 py-1.5 text-xs font-bold rounded-lg transition-all duration-200 flex items-center gap-2"
-                :class="currentFilter==='pending' ? 'bg-white text-indigo-600 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'">
-                <i class="fa-regular fa-clock"></i> 待处理
-              </button>
-              <button @click="changeFilter('downloading')" 
-                class="px-4 py-1.5 text-xs font-bold rounded-lg transition-all duration-200 flex items-center gap-2"
-                :class="currentFilter==='downloading' ? 'bg-white text-blue-600 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'">
-                <i class="fa-solid fa-cloud-arrow-down"></i> 进行中
-              </button>
-              <button @click="changeFilter('failed')" 
-                class="px-4 py-1.5 text-xs font-bold rounded-lg transition-all duration-200 flex items-center gap-2"
-                :class="currentFilter==='failed' ? 'bg-white text-red-500 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'">
-                <i class="fa-solid fa-circle-exclamation"></i> 已失败
+                :class="currentFilter===tab.key ? tab.activeClass : 'text-slate-500 hover:text-slate-700'">
+                <i :class="tab.icon"></i> {{ tab.label }}
               </button>
           </div>
 
@@ -208,7 +213,7 @@ watch(currentFilter, () => {
                  class="group relative bg-white border border-slate-100 rounded-xl p-3 shadow-sm hover:shadow-md transition-all duration-200 cursor-pointer overflow-hidden"
                  :class="{'ring-2 ring-indigo-500 border-transparent bg-indigo-50/10': selectedIds.has(item.id)}">
                 
-                <div v-if="currentFilter === 'downloading'" class="absolute bottom-0 left-0 h-1 bg-blue-500/10 w-full">
+                <div v-if="currentFilter === 'processing'" class="absolute bottom-0 left-0 h-1 bg-blue-500/10 w-full">
                      <div class="h-full bg-blue-500/50 animate-progress origin-left w-full"></div>
                 </div>
 
@@ -236,21 +241,17 @@ watch(currentFilter, () => {
 
                     <div class="text-right flex flex-col items-end gap-1">
                          <div class="text-[10px] font-bold px-2 py-0.5 rounded-full border flex items-center gap-1"
-                              :class="{
-                                  'bg-slate-100 text-slate-500 border-slate-200': currentFilter === 'pending',
-                                  'bg-blue-50 text-blue-600 border-blue-100': currentFilter === 'downloading',
-                                  'bg-red-50 text-red-500 border-red-100': currentFilter === 'failed'
-                              }">
-                             <i v-if="currentFilter === 'downloading'" class="fa-solid fa-circle-notch fa-spin"></i>
-                             <i v-if="currentFilter === 'failed'" class="fa-solid fa-circle-exclamation"></i>
-                             {{ currentFilter === 'pending' ? '等待调度' : (currentFilter === 'downloading' ? '离线中' : `重试: ${item.retryCount}`) }}
+                              :class="getFilterBadgeClass(currentFilter)">
+                             <i v-if="currentFilter === 'processing'" class="fa-solid fa-circle-notch fa-spin"></i>
+                             <i v-else-if="currentFilter === 'failed'" class="fa-solid fa-circle-exclamation"></i>
+                             {{ getFilterStatusText(currentFilter, item) }}
                          </div>
                          <span class="text-[9px] text-slate-300 uppercase font-bold tracking-wider">{{ item.sourceType }}</span>
                     </div>
                 </div>
 
                 <div v-if="currentFilter === 'failed' && item.retryCount > 0" class="mt-2 text-[10px] text-red-400 bg-red-50/50 px-2 py-1 rounded border border-red-100/50 truncate">
-                    <i class="fa-solid fa-triangle-exclamation mr-1"></i> 多次尝试秒传失败，已转入失败队列等待人工处理
+                    <i class="fa-solid fa-triangle-exclamation mr-1"></i> 多次尝试探测/校验失败，已转入失败队列等待人工处理
                 </div>
             </div>
         </TransitionGroup>
@@ -276,7 +277,7 @@ watch(currentFilter, () => {
                 <span class="text-slate-300">已选</span>
             </div>
 
-            <button v-if="currentFilter !== 'downloading'" @click="retrySelected" class="px-3 py-1.5 hover:bg-white/10 rounded-lg text-xs font-bold text-emerald-400 transition-colors flex items-center gap-1.5">
+            <button v-if="currentFilter !== 'processing'" @click="retrySelected" class="px-3 py-1.5 hover:bg-white/10 rounded-lg text-xs font-bold text-emerald-400 transition-colors flex items-center gap-1.5">
                 <i class="fa-solid fa-rotate-right"></i> 重试
             </button>
 

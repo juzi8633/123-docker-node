@@ -25,6 +25,40 @@ Read this file together with:
 - `ui/src/utils/*`
 
 --------------------------------------------------
+0. Fast summary for future readers
+--------------------------------------------------
+
+0.1 Current project position
+- treat this project as a supporting media-ingestion system for `emby-lite`, not as the main control plane
+- current active ingest surface is centered on `123`, `189`, and RapidTransfer JSON
+- frontend and backend are still tightly coupled in one small full-stack service
+
+0.2 Scope reductions already landed
+- Quark has been removed from the active frontend import/config flow
+- 123 offline-download fallback has been removed from the active backend runtime path
+- probe / verification / staged pending-task handling remain in place
+- verification page semantics now reflect `pending / processing / failed`, not the older offline-download wording
+
+0.3 Recognition-chain changes already landed
+- episode parsing now has a layered form via `parseEpisodeDetail(text)` with `strong / weak / none`
+- weak episode signals no longer independently force `isTV = true`
+- TV preview episode labels (`_previewEpStr`) now also respect episode confidence
+- single-file recognition now preserves:
+  - `searchQuery`
+  - `fallbackSearchQuery`
+  - `searchQuerySource`
+- TMDB auto-match can try one fallback query only when the primary query is weak or empty-result
+
+0.4 Import/match pipeline in one line
+- parse source files -> recognize/group locally in `ui/src/utils/logic.js` -> auto match TMDB in `ImportView.vue` -> rebuild normalized import JSON -> submit to backend
+
+0.5 Easy mistakes to avoid
+- do not assume old offline-download callbacks or task wording still represent the active path
+- do not assume Quark is still part of the operator-facing import workflow
+- do not treat `parseEpisode()` as the whole episode-recognition story; current code also depends on `parseEpisodeDetail()` semantics
+- do not assume `searchQuery` is the only title signal anymore; fallback query support now exists in current source
+
+--------------------------------------------------
 1. What this project really is
 --------------------------------------------------
 
@@ -33,16 +67,16 @@ It is a small full-stack media-ingestion and library-management service for clou
 
 Current code shows five major responsibilities:
 - maintain a local media library index in SQLite via Prisma
-- parse share links from 123 / 189 / Quark and turn them into normalized import JSON
-- accept trusted imports directly or queue non-trusted imports for background verification / offline processing
+- parse share links from active frontend-supported sources (`123` / `189`) plus direct RapidTransfer-style JSON into normalized import data
+- accept trusted imports directly or queue non-trusted imports for background verification / pending handling
 - use Redis + BullMQ for background task dispatch and lock/caching behavior
 - serve a Vue single-page admin UI from the same Fastify process
 
 A good mental model is:
 - `SeriesMain` = one movie or one show
 - `SeriesEpisode` = actual stored playable/subtitle file rows
-- `PendingEpisode` = staged tasks waiting for verification/offline handling
-- backend = control plane + ingestion pipeline
+- `PendingEpisode` = staged tasks waiting for verification, retry, or manual handling
+- backend = ingest/control pipeline for media data
 - frontend = operator console
 
 --------------------------------------------------
@@ -168,10 +202,12 @@ Interpretation:
 Simple key-value config table.
 Stores runtime credentials and operator settings such as:
 - `tmdb_key`
-- `quark_cookie`
 - `account_vip`
 - `account_workers`
 - `cloud189_token`
+
+Important note:
+- older versions/config shapes included fields such as `quark_cookie`, but current active frontend config flow in this workspace has already been narrowed away from Quark
 
 --------------------------------------------------
 4. Backend entrypoint and HTTP model
@@ -283,21 +319,22 @@ Each job roughly does:
 3. dedupe against final `SeriesEpisode`
 4. try rapid-upload / reuse probe via `core123.probeFileByHash(...)`
 5. if reusable, write final `SeriesEpisode` row directly
-6. otherwise try offline task submission (except Quark, which is explicitly unsupported for offline here)
-7. update `PendingEpisode.taskId`
+6. otherwise keep the item in pending/manual-review style state instead of submitting a 123 offline-download task
+7. update pending-row retry/task state as needed for the reduced verification pipeline
 
 Important semantics:
 - duplicate / lower-score files are deleted from pending queue and skipped
 - subtitle/video distinction affects dedupe and replacement behavior
 - pending rows are the queue truth source
+- current queue path should be read as probe/verify-oriented, not offline-download-oriented
 
 6.4 189 special path
-- 189 tasks require resolving a temporary direct link through `resolve189Link(...)`
+- 189-specific task handling still exists in current backend flow where provider-specific reference resolution is needed
 - token is read from Redis key `auth:189:token`
 
 Interpretation:
 - 189 support is partially normalized into the same queue pipeline
-- but it still has provider-specific URL signing logic in queue worker
+- but it still has provider-specific URL/signing or reference-resolution logic in queue worker
 
 --------------------------------------------------
 7. Logging model
@@ -331,10 +368,10 @@ It owns:
 - direct link caching
 - probe/reuse logic
 - cache-directory lifecycle
-- offline download submission
+- direct/provider-side helper calls that still belong to the active non-offline path
 
 8.1 Client roles
-- `vipClient`: used for storage/download/offline operations
+- `vipClient`: used for privileged storage/download/direct-link style operations in the active path
 - `workerClients`: used for probing / upload_request reuse checks
 
 Interpretation:
@@ -382,11 +419,10 @@ Important observation:
 - current effective behavior is mostly Redis-key cleanup, not confirmed physical folder deletion
 - do not claim old folders are truly deleted unless code is changed
 
-8.6 Offline task submission
-`addOfflineTask(...)`:
-- calls 123 open API offline download endpoint
-- stores into current cache dir
-- accepts callback URL
+8.6 Offline submission status
+- older versions of this project exposed explicit 123 offline-download submission here
+- current source in this workspace no longer keeps `addOfflineTask(...)` as an active method in `src/services/core123.js`
+- do not assume a live offline-download submit path still exists just because cache-folder or VIP client behavior remains
 
 --------------------------------------------------
 9. Low-level 123 Web API client
@@ -527,6 +563,17 @@ Interpretation:
 - frontend does substantial pre-ingestion normalization, not just display
 - backend still revalidates/standardizes later
 
+Current recognition-chain details that matter after recent source changes:
+- `parseEpisode(text)` is no longer the only episode API; `parseEpisodeDetail(text)` now exists and returns `{ value, confidence, source }`
+- current confidence model is intentionally minimal: `strong | weak | none`
+- strong episode signals include explicit season/episode or episode markers (for example `SxxExx`, `EPxx`, `第xx集/话`, bracketed/delimited episode patterns already present in source)
+- weak episode signal currently means the loose leading-number fallback
+- `extractFileInfo(fullPath)` no longer treats any episode number equally: weak episode signals do not independently force `isTV = true`; they only help when combined with season evidence
+- `autoGroupFiles(rawFilesData)` now also uses episode confidence when generating TV preview episode strings:
+  - strong episode signals can directly produce `_previewEpStr`
+  - weak episode signals only produce `_previewEpStr` when season information is also present
+- `extractFileInfo(fullPath)` now returns `fallbackSearchQuery` and `searchQuerySource` in addition to `searchQuery`; this is a minimal title-chain enhancement, not a full candidate system rewrite
+
 --------------------------------------------------
 12. Main backend APIs
 --------------------------------------------------
@@ -548,7 +595,7 @@ Interpretation:
 
 12.3 Pending task APIs
 - `GET /api/pending/list`
-  - filter by `pending`, `downloading`, `failed`
+  - filter by `pending`, `processing`, `failed`
 - `POST /api/pending/delete`
 - `POST /api/do/` with action `ADD_TASKS`
 
@@ -571,10 +618,10 @@ Important semantics:
 This is a key route.
 It supports two modes:
 - trusted source (`123` or `json`) => directly writes final `SeriesEpisode`
-- untrusted source (`189`, `quark`, etc.) => creates `PendingEpisode` rows and queues tasks
+- untrusted source (`189` and other non-trusted provider-shaped imports) => creates `PendingEpisode` rows and queues tasks
 
 Important semantics:
-- `handleMetadataMigration(...)` only detects changed metadata now; current code returns a boolean but does not visibly trigger a larger regeneration path
+- the older `handleMetadataMigration(...)` path is no longer part of the active `src/app.js` flow in this workspace
 - trusted import deduplicates by `(tmdbId, season, episode)` and overwrites non-subtitle video rows in batch
 - untrusted import creates staged rows first, then queues background jobs after transaction
 
@@ -603,16 +650,13 @@ Interpretation:
 
 This is SSE-based and delegates to the provider parser service.
 
-12.10 123 offline callback
-- `POST /api/callback/123`
-
-Current behavior:
-- marks pending row `taskId` as `DONE` when callback status is 0
-- otherwise leaves it unchanged/undefined
+12.10 123 offline callback status
+- older versions exposed `POST /api/callback/123`
+- current `src/app.js` in this workspace no longer keeps that route active
 
 Important observation:
-- this callback updates task state, but current code shown does not finalize a downloaded pending file into `SeriesEpisode` here
-- do not assume callback alone completes ingestion into final library rows
+- do not read the current backend flow through the old callback-based offline-download mental model
+- pending-task completion/failure handling should now be understood from the reduced queue/probe/manual-review path actually present in source
 
 --------------------------------------------------
 13. Frontend app structure
@@ -672,12 +716,20 @@ Important frontend/backend mismatch to remember:
 Interpretation:
 - frontend performs a lot of ingestion intelligence before the backend write step
 
+Current matching behavior as actually modified in source:
+- automatic TMDB matching still uses item-level `isTV`, `tmdbId`, `searchQuery`, and `year`
+- `autoMatchSingleItem(...)` now has a small internal helper for “search once with one query” and reuses it for the primary query
+- if the primary query returns no candidate or only a low-confidence candidate (`score < 60`), it may try exactly one more search using `fallbackSearchQuery`
+- this fallback does not change scoring rules or concurrency; it only adds a second query attempt when the first query is weak
+- final acceptance now scores the chosen candidate against the actual query that produced it, not always the original primary query
+
 13.6 Verification view
 `VerificationView.vue`:
 - polls `/api/pending/list`
 - maintains selection state
 - can retry selected tasks through `/api/do/`
 - can bulk-delete pending rows
+- current visible task semantics are aligned to `pending / processing / failed`, not the older offline-download wording
 
 --------------------------------------------------
 14. Frontend utility modules
@@ -700,54 +752,170 @@ Files:
 - packages selected pending items and posts `ADD_TASKS` to `/api/do/`
 
 Important observation:
-- payload field names here use snake_case (`clean_name`, `source_type`, `source_ref`)
-- backend `/api/do/` expects/uses camelCase-ish access in places (`name`, `sourceType`, `sourceRef`)
-- this is a real area to read carefully before changing retry logic
+- current source has already been adjusted toward camelCase-first payload shaping while still tolerating legacy snake_case input data
+- this area still deserves careful reading before changing retry logic, because pending-task payload normalization has historically been a mismatch surface
 
 14.4 `toast.js`
 - reactive global toast queue
 
 --------------------------------------------------
-15. Important implementation truths and easy-to-misread semantics
+15. Recent code-grounded changes already applied in this workspace
 --------------------------------------------------
 
-15.1 Final library rows vs pending rows are distinct
+This section documents meaningful changes that are already reflected in the current source files read during this session. It is not a full project changelog, but it does record the important behavior-affecting optimizations and scope reductions already landed.
+
+15.1 Backend scope reduction: offline-download branch removed, probe/verification kept
+Files involved:
+- `src/queue.js`
+- `src/app.js`
+- `src/services/core123.js`
+
+Current source now shows:
+- probe success still goes through the normal ingest path
+- probe failure no longer falls back to creating a 123 offline-download task
+- queue worker now returns a manual-review/probe-failed style outcome instead of submitting an offline task
+- `/api/callback/123` has been removed from `src/app.js`
+- `Core123Service.addOfflineTask(...)` has been removed from `src/services/core123.js`
+
+Interpretation:
+- this project has been narrowed from “probe + offline download” toward “probe + metadata ingest + pending/manual handling”
+- do not assume 123 offline download still exists in the active runtime path just because older comments or mental models may suggest it
+- direct/probe-related methods such as hash probing and download-url resolution are still present when they belong to the non-offline main path
+
+15.2 Frontend product scope reduction: Quark removed from active import flow
+Files involved:
+- `ui/src/components/ConfigPanel.vue`
+- `ui/src/components/ImportView.vue`
+- `ui/src/utils/configStore.js`
+
+Current source now shows:
+- Quark config entry points removed from UI config panel
+- Quark detection and cookie-passing removed from import flow
+- visible import copy now targets `123/189` share links or RapidTransfer JSON
+
+Interpretation:
+- although some backend/provider files may still exist historically, active frontend workflow has been narrowed away from Quark
+- current operator-facing import experience is centered on `123`, `189`, and direct JSON
+
+15.3 Frontend navigation and pending-task semantics were realigned to current backend behavior
+Files involved:
+- `ui/src/App.vue`
+- `ui/src/components/VerificationView.vue`
+- `src/app.js`
+- `ui/src/utils/dispatcher.js`
+
+Current source now shows:
+- the “任务与验证” tab entry has been restored in the main app shell
+- verification-task filter semantics were narrowed to `pending / processing / failed`
+- backend `/api/pending/list` now recognizes `processing`
+- current processing state is tied to queued/verification handling rather than the old offline-download wording
+- retry payload normalization in `dispatcher.js` now prefers camelCase while still tolerating snake_case input data
+
+Interpretation:
+- do not read the verification page through the old “offline downloading” mental model
+- current visible task states map to the reduced backend queue/verification pipeline
+
+15.4 Multi-link import v1 is already in place on the frontend
+File involved:
+- `ui/src/components/ImportView.vue`
+
+Current source now shows:
+- a single input area can extract multiple `123` / `189` share links
+- parsing is still serialized through the existing single-link `/api/stream` SSE endpoint
+- no backend multi-link API was introduced
+- each parsed import item carries its own `sourceContext` (`panType`, `shareUrl`, `sharePassword`, task id)
+- mixed-source groups are not auto-merged just because they look similar
+
+Interpretation:
+- this was intentionally implemented as a low-risk orchestration layer in the frontend, not as a backend contract rewrite
+- item-level source context matters for later TMDB match application and `/api/submit` payload shaping
+
+15.5 TMDB request pressure was reduced before matcher logic was expanded
+File involved:
+- `ui/src/components/ImportView.vue`
+
+Current source now shows:
+- batch auto-match concurrency is intentionally reduced to `1`
+- batches wait between attempts
+- transient TMDB/network failures can be retried once through the shared fetch cache helper
+
+Interpretation:
+- current TMDB matching path is intentionally conservative under API pressure
+- do not casually re-increase concurrency without checking why this was reduced
+
+15.6 Recent recognition-chain hardening already landed in `ui/src/utils/logic.js`
+File involved:
+- `ui/src/utils/logic.js`
+
+Current source now shows:
+- title cleaning had already been strengthened earlier for mixed Chinese/English titles, broader season/episode patterns, and deeper TMDB ID directory lookup
+- `parseEpisodeDetail(text)` now exists and returns `{ value, confidence, source }`
+- `parseEpisode(text)` remains as a compatibility wrapper returning only `.value`
+- weak episode signals no longer independently force `isTV = true`
+- TV preview episode labels (`_previewEpStr`) now also respect weak-vs-strong episode confidence
+- `extractFileInfo(fullPath)` now returns `fallbackSearchQuery` and `searchQuerySource`
+
+Interpretation:
+- the recognition chain has moved away from “single value only” toward a minimal layered model:
+  - episode confidence layering (`strong/weak/none`)
+  - primary vs fallback title query
+  - query source tracking
+
+15.7 Recent matcher behavior change: one fallback query attempt, not a matcher rewrite
+File involved:
+- `ui/src/components/ImportView.vue`
+
+Current source now shows:
+- automatic matching still primarily uses `isTV`, `tmdbId`, `searchQuery`, and `year`
+- query search logic was factored into a small per-query helper
+- when the primary query has no result or only a low-confidence result, matching may attempt one more query via `fallbackSearchQuery`
+- final acceptance scores the candidate against the query that actually produced it
+
+Interpretation:
+- this is a minimal resilience improvement, not a full multi-query search framework
+- keep this distinction in mind before proposing broader matcher rewrites
+
+--------------------------------------------------
+16. Important implementation truths and easy-to-misread semantics
+--------------------------------------------------
+
+16.1 Final library rows vs pending rows are distinct
 - `SeriesEpisode` = accepted/finalized library file rows
 - `PendingEpisode` = staged work items
 Do not merge these concepts when modifying queue logic.
 
-15.2 Trusted vs untrusted import source is a core branch
+16.2 Trusted vs untrusted import source is a core branch
 - `123` and `json` are treated as trusted in `/api/submit`
 - others go through pending queue
 This distinction affects whether files enter library immediately or not.
 
-15.3 Score decides overwrite, not coexistence
+16.3 Score decides overwrite, not coexistence
 For videos of same `(tmdbId, season, episode)`:
 - lower-score version is skipped
 - higher-score version can replace previous non-subtitle rows
 Subtitles are additive alongside chosen video.
 
-15.4 Movies are stored as episode-like rows
+16.4 Movies are stored as episode-like rows
 Movie imports use season/episode `0/0` logic in multiple places.
 Do not assume `SeriesEpisode` means “TV only”.
 
-15.5 Queue worker is intentionally serialized
+16.5 Queue worker is intentionally serialized
 The queue is not slow by accident.
 Current `concurrency: 1` and limiter indicate deliberate throttling.
 Do not casually raise concurrency without checking upstream API sensitivity and lock semantics.
 
-15.6 `recycleAllCacheFolders()` does not currently guarantee remote deletion
+16.6 `recycleAllCacheFolders()` does not currently guarantee remote deletion
 The trash call is commented out.
 Current code mainly cleans Redis directory-id cache entries.
 
-15.7 Frontend source contains substantial business logic
+16.7 Frontend source contains substantial business logic
 Especially in import/grouping/rebuild flows.
 Do not treat frontend as dumb presentation-only code.
 
-15.8 Some naming mismatches likely exist
+16.8 Some naming mismatches likely exist
 Examples visible from source:
 - frontend library sort references `last_updated` while backend returns `lastUpdated`
-- dispatcher sends snake_case fields while backend routes often use camelCase-like names
+- pending-task/retry payload normalization has historically crossed camelCase and snake_case boundaries
 Treat such mismatches as real potential bug surfaces.
 
 --------------------------------------------------
@@ -761,7 +929,7 @@ When modifying this repository:
 - remember that the same process runs API + queue worker
 - be careful with provider-specific fields like `S3KeyFlag`, `source_ref`, `taskId`, `cloud189_token`
 - do not assume 123 / 189 / Quark share parsers are interchangeable internally; only their output format is normalized
-- do not claim webhook/offline callback fully finalizes ingestion unless code explicitly writes final library rows
+- do not claim webhook or historical callback-style paths fully finalize ingestion unless code explicitly writes final library rows
 
 Low-risk changes usually look like:
 - field-name consistency fixes

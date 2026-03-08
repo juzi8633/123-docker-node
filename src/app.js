@@ -197,23 +197,21 @@ app.get('/api/pending/list', async (req, reply) => {
     const skip = (parseInt(page) - 1) * take;
     let where = {};
 
-    if (filter === 'downloading') {
-        where = { 
-            taskId: { not: null, notIn: ['DONE', 'QUEUED'] } 
+    if (filter === 'processing') {
+        where = {
+            taskId: 'QUEUED'
         };
-    } 
+    }
     else if (filter === 'failed') {
-        where = { 
-            retryCount: { gt: 0 }, 
-            taskId: null 
+        where = {
+            retryCount: { gt: 0 },
+            taskId: null
         };
-    } 
-    else { 
-        where = { 
-            OR: [
-                { taskId: null },
-                { taskId: 'QUEUED' }
-            ]
+    }
+    else {
+        where = {
+            taskId: null,
+            retryCount: 0
         };
     }
 
