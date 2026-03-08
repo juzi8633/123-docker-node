@@ -54,7 +54,8 @@ export function parseSeason(text) {
     if (standardMatch) return parseInt(standardMatch[1]);
 
     const m = text.match(/(?:^|[\.\s_])(?:Season|S)\s*(\d+)(?:[\.\s_]|E|$)/i) || 
-              text.match(/第([一二三四五六七八九十0-9]+)季/);
+              text.match(/第([一二三四五六七八九十0-9]+)季/) ||
+              text.match(/(?:第)?([一二三四五六七八九十0-9]+)季(?:全|完结)?/);
     if (m) {
         return /^\d+$/.test(m[1]) ? parseInt(m[1]) : cnToInt(m[1]);
     }
@@ -66,16 +67,19 @@ export function parseEpisode(text) {
     const strictPatterns = [
         /[Ee][Pp]?(\d+)/,
         /S\d+[Ee](\d+)/i,
-        /第([0-9]+)[集话]/,
-        /\[(\d+)\]/,
-        / - (\d+) (?:\[|t|v|\.)/
+        /第([0-9一二三四五六七八九十两〇零]+)[集话]/,
+        /\[(\d{1,3})\]/,
+        / - (\d{1,3}) (?:\[|t|v|\.)/,
+        /(?:^|[^\d])(?:EP?|第)?(\d{1,3})(?:END|FIN|V\d+)?(?:[^\d]|$)/i
     ];
     for (const p of strictPatterns) {
         const m = text.match(p);
-        if (m) return parseInt(m[1]);
+        if (m) {
+            return /^\d+$/.test(m[1]) ? parseInt(m[1]) : cnToInt(m[1]);
+        }
     }
     const nameWithoutExt = text.replace(/\.[^/.]+$/, "");
-    const looseMatch = nameWithoutExt.match(/^(\d+)(?:[\s\._\-]|$)/);
+    const looseMatch = nameWithoutExt.match(/^(\d{1,3})(?:[\s\._\-]|$)/);
     if (looseMatch) {
         const num = parseInt(looseMatch[1]);
         const currentYear = new Date().getFullYear();
@@ -100,10 +104,13 @@ const JUNK_TERMS_LOOSE = [
     /(^|\s)(mp4ba|rarbg|criterion|collection)($|\s)/i,
     /(^|\s)(高码|收藏|\d+帧|邵氏|4K265)($|\s)/i,
     /www\.[a-z0-9]+\.[a-z]+/i,
-    /\[.*?\]/g, /【.*?】/g, 
+    /\[.*?\]/g, /【.*?】/g,
+    /\(.*?\)/g, /（.*?）/g,
     /(^|\s)Top\d+($|\s)/i,
     /(^|\s)(国语|英语|粤语|双语|HD)($|\s)/i,
-    /(^|\s)(高码版?|修正版?|收藏版?)($|\s)/i
+    /(^|\s)(高码版?|修正版?|收藏版?)($|\s)/i,
+    /(^|\s)(完结|全\d+集|全\d+话|全\d+季|全|简繁|繁中|简中)($|\s)/i,
+    /(^|\s)(外挂字幕|内封字幕|内嵌字幕|官译|机翻)($|\s)/i
 ];
 
 const extractors = {
@@ -124,12 +131,14 @@ const extractors = {
             .replace(/\//g, " ");
 
         const breakPoints = [
-            /(?:19|20)\d{2}/, 
-            /S\d+E\d+/i, /S\d+/i, /Season\s*\d+/i, 
-            /第\d+[季集期]/, /先导片/,
-            /1080[pP]|720[pP]|2160[pP]|4[kK]|8[kK]/, 
-            /BluRay|WEB-?DL|WEBRip|HDTV|Remux|ISO|DVD/i, 
-            /H\.?26[45]|HEVC|AVC|AV1|AAC|DTS|Atmos|TrueHD/i, 
+            /(?:19|20)\d{2}/,
+            /S\d+E\d+/i, /S\d+/i, /Season\s*\d+/i,
+            /第[一二三四五六七八九十0-9]+[季集期话]/,
+            /第\d+[-_ ]?\d+[集话]/,
+            /先导片|特别篇|特典|SP\d*/i,
+            /1080[pP]|720[pP]|2160[pP]|4[kK]|8[kK]/,
+            /BluRay|WEB-?DL|WEBRip|HDTV|Remux|ISO|DVD/i,
+            /H\.?26[45]|HEVC|AVC|AV1|AAC|DTS|Atmos|TrueHD/i,
         ];
 
         let cutoffIndex = raw.length;
@@ -143,13 +152,18 @@ const extractors = {
         raw = raw.substring(0, cutoffIndex);
         raw = raw.replace(/[\.\_\-\[\]【】\(\)（）]/g, ' ').trim();
         JUNK_TERMS_STRICT.forEach(regex => { raw = raw.replace(regex, ' '); });
-        JUNK_TERMS_LOOSE.forEach(regex => { 
+        JUNK_TERMS_LOOSE.forEach(regex => {
             let oldRaw;
             do { oldRaw = raw; raw = raw.replace(regex, ' '); } while (raw !== oldRaw);
         });
-        raw = raw.replace(/版$/i, '');
+        raw = raw
+            .replace(/^[\s\._\-]+/, '')
+            .replace(/[\s\._\-]+$/, '')
+            .replace(/版$/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
 
-        return raw.replace(/\s+/g, ' ').trim();
+        return raw;
     }
 };
 
@@ -161,11 +175,11 @@ export function extractFileInfo(fullPath) {
     fileName = fileName.replace(/\.(mp4|mkv|avi|mov|wmv|iso|ts|flv|srt|ass|ssa|sub|vtt|rmvb|webm|m2ts)$/i, "");
 
     let tmdbId = null;
-    if (parts.length >= 2) {
-        const parentDir = parts[parts.length - 2];
-        const idMatch = parentDir.match(TMDB_ID_REGEX);
+    for (let i = parts.length - 1; i >= Math.max(0, parts.length - 4); i--) {
+        const idMatch = parts[i].match(TMDB_ID_REGEX);
         if (idMatch) {
             tmdbId = idMatch[1];
+            break;
         }
     }
 
@@ -180,31 +194,61 @@ export function extractFileInfo(fullPath) {
     let rawTitle = extractors.smartCleanTitle(fileName);
     let chineseName = "";
     let englishName = "";
-    
-    const tailEngMatch = rawTitle.match(/([a-zA-Z0-9\s:：',\-\.!&×]{2,})$/);
-    const headEngMatch = rawTitle.match(/^([a-zA-Z0-9\s:：',\-\.!&×]{2,})\s+[^a-zA-Z]/);
 
-    if (tailEngMatch) {
-        const potentialEng = tailEngMatch[1].trim();
-        if (/^\d+$/.test(potentialEng) || potentialEng.length < 2) {
-             chineseName = rawTitle;
-        } else {
-             englishName = potentialEng;
-             const leftOver = rawTitle.substring(0, tailEngMatch.index).trim();
-             chineseName = leftOver || englishName;
+    const splitMixedTitle = (title) => {
+        const normalized = String(title || '').replace(/\s+/g, ' ').trim();
+        if (!normalized) return { chinese: '', english: '' };
+
+        const hasChinese = /[\u4e00-\u9fa5]/.test(normalized);
+        const hasEnglish = /[a-zA-Z]/.test(normalized);
+        if (!hasChinese || !hasEnglish) {
+            return {
+                chinese: hasChinese ? normalized : '',
+                english: hasEnglish ? normalized : ''
+            };
         }
-    } else if (headEngMatch) {
-        const potentialEng = headEngMatch[1].trim();
-        if (!/^\d+$/.test(potentialEng) && potentialEng.length >= 2) {
-            englishName = potentialEng;
-            chineseName = rawTitle.substring(headEngMatch[0].length - 1).trim(); 
-        } else {
-            chineseName = rawTitle;
+
+        const parts = normalized.split(/\s{2,}|\s+-\s+|\s+\/\s+/).map(s => s.trim()).filter(Boolean);
+        if (parts.length >= 2) {
+            const chinesePart = parts.find(p => /[\u4e00-\u9fa5]/.test(p) && !/[a-zA-Z]{3,}/.test(p));
+            const englishPart = parts.find(p => /[a-zA-Z]/.test(p));
+            return {
+                chinese: chinesePart || '',
+                english: englishPart || ''
+            };
         }
-    } else {
+
+        const tailEngMatch = normalized.match(/([a-zA-Z][a-zA-Z0-9\s:：',\-\.!&×]{1,})$/);
+        if (tailEngMatch && tailEngMatch.index > 0) {
+            const english = tailEngMatch[1].trim();
+            const chinese = normalized.substring(0, tailEngMatch.index).trim();
+            if (chinese && english && !/^\d+$/.test(english)) {
+                return { chinese, english };
+            }
+        }
+
+        const headEngMatch = normalized.match(/^([a-zA-Z][a-zA-Z0-9\s:：',\-\.!&×]{1,})\s+(.+)$/);
+        if (headEngMatch) {
+            const english = headEngMatch[1].trim();
+            const chinese = headEngMatch[2].trim();
+            if (chinese && english && /[\u4e00-\u9fa5]/.test(chinese) && !/^\d+$/.test(english)) {
+                return { chinese, english };
+            }
+        }
+
+        return { chinese: normalized, english: '' };
+    };
+
+    const mixed = splitMixedTitle(rawTitle);
+    chineseName = mixed.chinese || '';
+    englishName = mixed.english || '';
+
+    if (!chineseName && !englishName) {
         chineseName = rawTitle;
     }
+
     chineseName = chineseName.replace(/[\.\s]+$/, '');
+    englishName = englishName.replace(/[\.\s]+$/, '');
     
     let searchQuery = englishName && englishName.length >= 2 ? englishName : chineseName;
 
@@ -216,25 +260,31 @@ export function extractFileInfo(fullPath) {
     };
     
     if (isInvalidTitle(searchQuery) && parts.length >= 2) {
-        let parentDir = parts[parts.length - 2];
-        const seasonFolderRegex = /^(Season\s*\d+|S\d+|Specials|第\d+季)$/i;
-        if (seasonFolderRegex.test(parentDir) && parts.length >= 3) {
-            parentDir = parts[parts.length - 3];
-        }
-        parentDir = parentDir.replace(TMDB_ID_REGEX, ''); 
-
-        let parentTitle = extractors.smartCleanTitle(parentDir);
-        if (!isInvalidTitle(parentTitle)) {
-            // console.log(`[识别修正] 文件名无效(${searchQuery})，回退使用目录名: [${parentTitle}]`);
-            searchQuery = parentTitle;
-            chineseName = parentTitle;
-            englishName = ""; 
+        const seasonFolderRegex = /^(Season\s*\d+|S\d+|Specials|第[一二三四五六七八九十0-9]+季)$/i;
+        for (let i = parts.length - 2; i >= Math.max(0, parts.length - 4); i--) {
+            let candidateDir = parts[i];
+            if (seasonFolderRegex.test(candidateDir)) continue;
+            candidateDir = candidateDir.replace(TMDB_ID_REGEX, '');
+            const parentTitle = extractors.smartCleanTitle(candidateDir);
+            if (!isInvalidTitle(parentTitle)) {
+                searchQuery = parentTitle;
+                chineseName = parentTitle;
+                englishName = "";
+                break;
+            }
         }
     }
 
+    searchQuery = searchQuery
+        .replace(/[·・]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
     const epNum = parseEpisode(fileName);
-    const isVariety = /第\d+期/.test(fileName) || /先导片/.test(fileName);
-    const isTV = isVariety || epNum !== null || /Season\s*\d+/i.test(normalizedPath);
+    const seasonNum = parseSeason(fileName) || parseSeason(parts[parts.length - 2] || '');
+    const isVariety = /第\d+期/.test(fileName) || /先导片|特别篇|特典/.test(fileName);
+    const hasSeasonFolder = /Season\s*\d+/i.test(normalizedPath) || /第[一二三四五六七八九十0-9]+季/.test(normalizedPath);
+    const isTV = isVariety || epNum !== null || seasonNum > 0 || hasSeasonFolder;
 
     return {
         originalName: fileName,

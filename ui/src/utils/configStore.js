@@ -4,7 +4,6 @@ import { reactive } from 'vue';
 // 全局响应式配置对象
 export const globalConfig = reactive({
     tmdbKey: '',
-    quarkCookie: '',
     account_vip: '',
     workerAccounts: '',
     open123DirId: '',
@@ -24,7 +23,6 @@ export async function initConfig() {
             const d = json.data;
             // 映射数据库 keys 到前端变量
             globalConfig.tmdbKey = d.tmdb_key || '';
-            globalConfig.quarkCookie = d.quark_cookie || '';
             globalConfig.account_vip = d.account_vip || '';
             globalConfig.workerAccounts = d.account_workers || '';
             globalConfig.open123DirId = d.open123_dir_id || '';

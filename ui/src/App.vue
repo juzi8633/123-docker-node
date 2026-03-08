@@ -3,7 +3,6 @@ import { ref, onMounted, computed } from 'vue'
 import ConfigPanel from './components/ConfigPanel.vue'
 import LibraryView from './components/LibraryView.vue'
 import ImportView from './components/ImportView.vue'
-import VerificationView from './components/VerificationView.vue'
 import GlobalConfirm from './components/GlobalConfirm.vue'
 import GlobalToast from './components/GlobalToast.vue'
 // 新增引入
@@ -54,7 +53,7 @@ const setupFetchInterceptor = () => {
                 // 只有当当前认为是“已登录”状态时才触发登出，避免死循环
                 if (isAuthenticated.value) {
                     console.warn('[Auth] 401 Unauthorized detected. Logging out...')
-                    showToast('登录会话已过期，请重新验证', 'error')
+                    showToast('登录会话已过期，请重新登录', 'error')
                     handleLogout()
                 }
             }
@@ -182,21 +181,13 @@ onMounted(async () => {
                 <i class="fa-solid fa-cloud-arrow-up" :class="{'animate-bounce-subtle': currentTab === 'import'}"></i> 导入资源
                 </button>
 
-                <button @click="switchTab('verify')" 
-                class="relative px-5 py-2.5 rounded-lg text-sm font-bold transition-all duration-200 flex items-center gap-2 flex-shrink-0 select-none outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-                :class="currentTab === 'verify' 
-                    ? 'bg-white text-indigo-600 shadow-sm ring-1 ring-black/5 scale-[1.02]' 
-                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'">
-                <i class="fa-solid fa-list-check" :class="{'animate-bounce-subtle': currentTab === 'verify'}"></i> 任务 & 验证
-                </button>
-
             </div>
             </div>
 
             <div class="p-6 flex-1 relative min-h-0 overflow-hidden flex flex-col">
             <Transition name="fade-slide" mode="out-in">
                 <KeepAlive>
-                <component :is="currentTab === 'library' ? LibraryView : currentTab === 'import' ? ImportView : VerificationView" />
+                <component :is="currentTab === 'library' ? LibraryView : ImportView" />
                 </KeepAlive>
             </Transition>
             </div>

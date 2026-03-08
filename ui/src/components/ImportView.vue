@@ -6,7 +6,7 @@ import {
   formatSize 
 } from '../utils/logic.js'
 import { showToast } from '../utils/toast.js'
-import { globalConfig, initConfig } from '../utils/configStore.js'
+import { globalConfig } from '../utils/configStore.js'
 
 // =========================
 // 逻辑完全保持不变
@@ -14,9 +14,11 @@ import { globalConfig, initConfig } from '../utils/configStore.js'
 const universalInput = ref('')
 const detectState = ref({ text: '', style: 'opacity-0 scale-90' })
 const showLinkOptions = ref(false)
-const panType = ref('123')
-const sharePassword = ref('')
-const shareUrl = ref('')
+const inputMode = ref('idle')
+const linkTasks = ref([])
+let importItemId = 1
+let currentParseRunId = 0
+let currentMatchRunId = 0
 
 const isParsing = ref(false)
 const parseStatusText = ref('处理中...')
@@ -31,10 +33,65 @@ const activeEditItem = ref(null)
 const tmdbSearchQuery = ref('')
 const tmdbDropdownList = ref([])
 const isSearchingTmdb = ref(false)
+const tmdbQueryCache = new Map()
 
 // ----------------------------------------------------------------
 // 输入处理
 // ----------------------------------------------------------------
+const detectLinkType = (text = '') => {
+  if (/123(pan|865|684|912)\.(com|cn)/.test(text)) return '123'
+  if (text.includes('189.cn')) return '189'
+  return ''
+}
+
+const extractPasswordFromLine = (line, type, shareUrlValue = '') => {
+  let pwd = ''
+  const pwdMatch = line.match(/(提取码|密码|访问码|接收码)[：:\s]*([a-zA-Z0-9]{4,20})/)
+  if (pwdMatch) pwd = pwdMatch[2]
+  if (shareUrlValue) {
+    try {
+      const urlObj = new URL(shareUrlValue)
+      if (type === '123') pwd = pwd || urlObj.searchParams.get('pwd') || ''
+      if (type === '189') pwd = pwd || urlObj.searchParams.get('code') || ''
+    } catch (e) {}
+  }
+  return pwd
+}
+
+const extractLinkTasksFromInput = (text) => {
+  const lines = String(text || '').split(/\r?\n/)
+  const tasks = []
+  const seen = new Set()
+  let seq = 1
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (!line) continue
+    const type = detectLinkType(line)
+    if (!type) continue
+    const urlMatch = line.match(/https?:\/\/[^\s"']+/)
+    if (!urlMatch) continue
+    const parsedUrl = urlMatch[0]
+    const parsedPassword = extractPasswordFromLine(line, type, parsedUrl)
+    const dedupeKey = `${type}|${parsedUrl}|${parsedPassword}`
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
+    tasks.push({
+      id: `link-${Date.now()}-${seq++}`,
+      panType: type,
+      shareUrl: parsedUrl,
+      sharePassword: parsedPassword,
+      rawText: line,
+      status: 'pending',
+      parseMessage: '',
+      errorMsg: '',
+      parsedJson: null
+    })
+  }
+
+  return tasks
+}
+
 let inputTimer = null
 const handleInput = () => {
   clearTimeout(inputTimer)
@@ -46,54 +103,29 @@ const handleInput = () => {
       try {
         const j = JSON.parse(val)
         if (j.files) {
+          inputMode.value = 'json'
+          linkTasks.value = []
           setDetectState('JSON 数据', 'success')
           showLinkOptions.value = false
-          shareUrl.value = ''
-          panType.value = 'json'
-          processParsedResult(j) 
+          importQueue.value = []
+          processParsedResult(j)
           return
         }
       } catch(e) {}
     }
 
-// 2. 网盘类型识别
-    let type = ''
-    if (/123(pan|865|684|912)\.(com|cn)/.test(val)) type = '123'
-    else if (val.includes('189.cn')) type = '189'
-    else if (val.includes('quark.cn')) type = 'quark'
-
-    if (type) {
-      setDetectState(`${type} 网盘`, 'info')
-      
-      // [修正点2] 使用更宽松的正则提取 URL，防止漏掉参数
-      const urlMatch = val.match(/https?:\/\/[^\s"']+/)
-      // 提取中文“密码：xxxx”的情况
-      const pwdMatch = val.match(/(提取码|密码|访问码|接收码)[：:\s]*([a-zA-Z0-9]{4,20})/)
-      
+    const tasks = extractLinkTasksFromInput(val)
+    if (tasks.length > 0) {
+      inputMode.value = 'links'
+      linkTasks.value = tasks
       showLinkOptions.value = true
-      panType.value = type
-      
-      if (urlMatch) {
-        shareUrl.value = urlMatch[0]
-        
-        // 尝试从 URL 参数中提取密码
-        try {
-            const urlObj = new URL(urlMatch[0])
-            if (type === '123') { 
-                sharePassword.value = urlObj.searchParams.get('pwd') || '' 
-            }
-            if (type === '189') { 
-                sharePassword.value = urlObj.searchParams.get('code') || '' 
-            }
-        } catch(e) {}
-      }
-
-      // 如果 URL 里没找到密码，再看有没有中文正则匹配到的
-      if (pwdMatch && !sharePassword.value) {
-          sharePassword.value = pwdMatch[2]
-      }
+      setDetectState(`识别到 ${tasks.length} 条分享链接`, 'info')
+      importQueue.value = []
       return
     }
+
+    inputMode.value = 'idle'
+    linkTasks.value = []
     setDetectState('未知格式', 'error')
   }, 500)
 }
@@ -106,13 +138,21 @@ const setDetectState = (text, type) => {
 }
 
 const resetUI = () => {
+  currentParseRunId += 1
+  currentMatchRunId += 1
+  if (eventSourceInstance.value) {
+    eventSourceInstance.value.close()
+    eventSourceInstance.value = null
+  }
+  isParsing.value = false
   showLinkOptions.value = false
+  inputMode.value = 'idle'
+  linkTasks.value = []
   detectState.value = { text: '', style: 'opacity-0 scale-90' }
   importQueue.value = []
   activeEditItem.value = null
-  shareUrl.value = ''
-  sharePassword.value = ''
-  panType.value = '123'
+  parseStatusText.value = '处理中...'
+  parsePercent.value = 0
 }
 
 const clearInput = () => {
@@ -123,59 +163,139 @@ const clearInput = () => {
 // ----------------------------------------------------------------
 // 链接解析
 // ----------------------------------------------------------------
-const startParsing = () => {
-  const cookie = globalConfig.quarkCookie || ''
-  if (panType.value === 'quark' && !cookie) {
-    showToast("请设置夸克Cookie", "error")
+const appendParsedResult = (task, rawJson) => {
+  if (!rawJson || !rawJson.files) return
+  const groups = autoGroupFiles(rawJson)
+  const items = groups.map((g) => ({
+    id: importItemId++,
+    key: `${task.id}:${g.key}`,
+    searchQuery: g.searchQuery,
+    year: g.year,
+    tmdbId: g.tmdbId,
+    isTV: g.isTV,
+    files: g.files,
+    expanded: false,
+    status: 'pending',
+    tmdbInfo: null,
+    finalJson: null,
+    errorMsg: '',
+    sourceContext: {
+      taskId: task?.id || 'json',
+      panType: task?.panType || 'json',
+      shareUrl: task?.shareUrl || '',
+      sharePassword: task?.sharePassword || ''
+    }
+  }))
+  importQueue.value.push(...items)
+}
+
+const parseSingleTask = (task, taskIndex, totalTasks, runId) => {
+  return new Promise((resolve) => {
+     if (runId !== currentParseRunId) {
+      resolve(false)
+      return
+    }
+    if (eventSourceInstance.value) {
+      eventSourceInstance.value.close()
+      eventSourceInstance.value = null
+    }
+
+    task.status = 'parsing'
+    task.errorMsg = ''
+    parsePercent.value = 0
+
+    const params = new URLSearchParams({
+      panType: task.panType,
+      shareUrl: task.shareUrl,
+      sharePassword: task.sharePassword || ''
+    })
+
+    const es = new EventSource(`./api/stream?${params}`)
+    eventSourceInstance.value = es
+
+    es.onmessage = (e) => {
+      if (runId !== currentParseRunId) {
+        es.close()
+        eventSourceInstance.value = null
+        resolve(false)
+        return
+      }
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'phase') {
+        task.parseMessage = msg.data.message
+        parseStatusText.value = `(${taskIndex + 1}/${totalTasks}) ${msg.data.message}`
+        parsePercent.value = 10
+      } else if (msg.type === 'scan') {
+        task.parseMessage = `发现 ${msg.data.count} 个文件`
+        parseStatusText.value = `(${taskIndex + 1}/${totalTasks}) 发现 ${msg.data.count} 个文件`
+        parsePercent.value = 40
+      } else if (msg.type === 'progress') {
+        task.parseMessage = `计算指纹 (${msg.data.processed}/${msg.data.total})`
+        parseStatusText.value = `(${taskIndex + 1}/${totalTasks}) 计算指纹 (${msg.data.processed}/${msg.data.total})`
+        parsePercent.value = Math.floor(40 + (msg.data.processed / msg.data.total) * 50)
+      } else if (msg.type === 'result') {
+        es.close()
+        eventSourceInstance.value = null
+        task.status = 'done'
+        task.parsedJson = msg.data.rapidTransferJson
+        task.parseMessage = '解析完成'
+        parsePercent.value = 100
+        appendParsedResult(task, msg.data.rapidTransferJson)
+        resolve(true)
+      } else if (msg.type === 'error') {
+        es.close()
+        eventSourceInstance.value = null
+        task.status = 'failed'
+        task.errorMsg = msg.data.message || '解析失败'
+        task.parseMessage = '解析失败'
+        resolve(false)
+      }
+    }
+
+    es.onerror = () => {
+      es.close()
+      eventSourceInstance.value = null
+      task.status = 'failed'
+      task.errorMsg = task.errorMsg || '解析连接中断'
+      task.parseMessage = '解析连接中断'
+      resolve(false)
+    }
+  })
+}
+
+const startParsing = async () => {
+  if (inputMode.value === 'json') {
     return
   }
-  
+  if (!linkTasks.value.length) return
+
+  const runId = ++currentParseRunId
+  const totalTasks = linkTasks.value.length
   isParsing.value = true
+  importQueue.value = []
   parsePercent.value = 0
-  
-  if (eventSourceInstance.value) {
-      eventSourceInstance.value.close()
+  let successCount = 0
+
+  for (let i = 0; i < totalTasks; i++) {
+    if (runId !== currentParseRunId) return
+    const task = linkTasks.value[i]
+    if (!task) break
+    const ok = await parseSingleTask(task, i, totalTasks, runId)
+    if (runId !== currentParseRunId) return
+    if (ok) successCount++
   }
 
-  const params = new URLSearchParams({ 
-    panType: panType.value, 
-    shareUrl: shareUrl.value, 
-    sharePassword: sharePassword.value, 
-    cookie: cookie || '' 
-  })
+  if (runId !== currentParseRunId) return
+  isParsing.value = false
+  parseStatusText.value = `解析完成：成功 ${successCount} / ${totalTasks}`
 
-  const es = new EventSource(`./api/stream?${params}`)
-  eventSourceInstance.value = es 
-
-  es.onmessage = (e) => {
-    const msg = JSON.parse(e.data)
-    if (msg.type === 'phase') {
-      parseStatusText.value = msg.data.message
-      parsePercent.value = 10
-    } else if (msg.type === 'scan') {
-      parseStatusText.value = `发现 ${msg.data.count} 个文件`
-      parsePercent.value = 40
-    } else if (msg.type === 'progress') {
-      parsePercent.value = Math.floor(40 + (msg.data.processed / msg.data.total) * 50)
-      parseStatusText.value = `计算指纹 (${msg.data.processed}/${msg.data.total})`
-    } else if (msg.type === 'result') {
-      es.close()
-      eventSourceInstance.value = null
-      parsePercent.value = 100
-      isParsing.value = false
-      processParsedResult(msg.data.rapidTransferJson)
-    } else if (msg.type === 'error') {
-      es.close()
-      eventSourceInstance.value = null
-      isParsing.value = false
-      showToast(msg.data.message, "error")
-    }
+  if (importQueue.value.length > 0) {
+    const matchRunId = ++currentMatchRunId
+    await runBatchAutoMatch(matchRunId)
   }
-  
-  es.onerror = () => { 
-      es.close(); 
-      eventSourceInstance.value = null;
-      isParsing.value = false; 
+
+  if (successCount < totalTasks) {
+    showToast(`部分链接解析失败：成功 ${successCount} / ${totalTasks}`, 'warning')
   }
 }
 
@@ -205,35 +325,21 @@ const getFilePreviewTag = (file) => {
     return 'File';
 }
 
-const processParsedResult = (rawJson) => {
+const processParsedResult = async (rawJson) => {
   if (!rawJson || !rawJson.files) return
-
-  const groups = autoGroupFiles(rawJson)
-  
-  importQueue.value = groups.map((g, index) => ({
-    id: index,
-    key: g.key,
-    searchQuery: g.searchQuery, 
-    year: g.year,
-    tmdbId: g.tmdbId, 
-    isTV: g.isTV,
-    files: g.files,
-    expanded: false,
-    
-    status: 'pending', 
-    tmdbInfo: null,    
-    finalJson: null,   
-    errorMsg: ''
-  }))
-
-  runBatchAutoMatch()
+  const matchRunId = ++currentMatchRunId
+  importQueue.value = []
+  appendParsedResult({ id: 'json', panType: 'json', shareUrl: '', sharePassword: '' }, rawJson)
+  await runBatchAutoMatch(matchRunId)
 }
 
-const runBatchAutoMatch = async () => {
+const runBatchAutoMatch = async (matchRunId = ++currentMatchRunId) => {
+  if (matchRunId !== currentMatchRunId) return
   isBatchMatching.value = true
   const apiKey = globalConfig.tmdbKey || '';
   
   if (!apiKey) {
+    if (matchRunId !== currentMatchRunId) return
     showToast("未配置 TMDB Key，请手动搜索", "warning")
     importQueue.value.forEach(item => { item.status = 'failed'; item.errorMsg = '缺少 API Key'; })
     isBatchMatching.value = false
@@ -244,11 +350,23 @@ const runBatchAutoMatch = async () => {
   const BATCH_SIZE = 3 
   
   for (let i = 0; i < queue.length; i += BATCH_SIZE) {
+    if (matchRunId !== currentMatchRunId) {
+      isBatchMatching.value = false
+      return
+    }
     const batch = queue.slice(i, i + BATCH_SIZE)
-    await Promise.all(batch.map(item => autoMatchSingleItem(item, apiKey)))
+    await Promise.all(batch.map(item => autoMatchSingleItem(item, apiKey, matchRunId)))
+    if (matchRunId !== currentMatchRunId) {
+      isBatchMatching.value = false
+      return
+    }
     if (i + BATCH_SIZE < queue.length) await new Promise(r => setTimeout(r, 250))
   }
   
+  if (matchRunId !== currentMatchRunId) {
+    isBatchMatching.value = false
+    return
+  }
   isBatchMatching.value = false
 }
 
@@ -257,35 +375,89 @@ const getResultYear = (res) => {
   return date ? parseInt(date.split('-')[0]) : 0;
 }
 
-const findBestMatch = (results, targetYear) => {
-  if (!results || results.length === 0) return null;
-  if (!targetYear) return results[0];
-
-  const target = parseInt(targetYear);
-  const exactMatch = results.find(res => getResultYear(res) === target);
-  if (exactMatch) return exactMatch;
-
-  const fuzzyMatch = results.find(res => Math.abs(getResultYear(res) - target) <= 1);
-  if (fuzzyMatch) return fuzzyMatch;
-
-  return null; 
+const normalizeTitle = (text) => {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[·・:：'"!?,.，。\-_/\\()\[\]【】]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
-const autoMatchSingleItem = async (item, apiKey) => {
+const getCandidateNames = (res) => {
+  return [res.name, res.title, res.original_name, res.original_title]
+    .filter(Boolean)
+}
+
+const scoreTmdbCandidate = (res, query, targetYear) => {
+  let score = 0
+  const normalizedQuery = normalizeTitle(query)
+  const names = getCandidateNames(res).map(normalizeTitle)
+
+  if (names.some(name => name === normalizedQuery)) score += 120
+  else if (names.some(name => name.startsWith(normalizedQuery))) score += 80
+  else if (names.some(name => name.includes(normalizedQuery))) score += 40
+
+  const resultYear = getResultYear(res)
+  if (targetYear) {
+    const target = parseInt(targetYear)
+    if (resultYear === target) score += 40
+    else if (Math.abs(resultYear - target) === 1) score += 18
+    else if (Math.abs(resultYear - target) === 2) score += 6
+    else score -= 12
+  }
+
+  score += Math.min(Number(res.popularity) || 0, 30)
+  return score
+}
+
+const findBestMatch = (results, query, targetYear) => {
+  if (!results || results.length === 0) return null;
+
+  const sorted = [...results].sort((a, b) => {
+    return scoreTmdbCandidate(b, query, targetYear) - scoreTmdbCandidate(a, query, targetYear)
+  })
+
+  return sorted[0] || null
+}
+
+const fetchTmdbJsonCached = async (url) => {
+  if (tmdbQueryCache.has(url)) {
+    return tmdbQueryCache.get(url)
+  }
+
+  const promise = fetch(url).then(async (res) => {
+    if (!res.ok) {
+      throw new Error(`TMDB HTTP ${res.status}`)
+    }
+    return res.json()
+  }).catch(err => {
+    tmdbQueryCache.delete(url)
+    throw err
+  })
+
+  tmdbQueryCache.set(url, promise)
+  return promise
+}
+
+const autoMatchSingleItem = async (item, apiKey, matchRunId = currentMatchRunId) => {
+  if (matchRunId !== currentMatchRunId) return
   item.status = 'loading'
   const type = item.isTV ? 'tv' : 'movie'
   const directId = item.tmdbId
   
   try {
     let bestMatch = null
+    let failReason = ''
     
     if (directId) {
         const url = `https://api.tmdb.org/3/${type}/${directId}?api_key=${apiKey}&language=zh-CN`
-        const res = await fetch(url)
-        if (res.ok) {
-            bestMatch = await res.json()
+        const data = await fetchTmdbJsonCached(url)
+        if (data && !data.success) {
+            bestMatch = data
             bestMatch.media_type = type 
-            bestMatch.genre_ids = bestMatch.genres.map(({id})=>id);
+            bestMatch.genre_ids = Array.isArray(bestMatch.genres) ? bestMatch.genres.map(({id})=>id) : []
+        } else {
+            failReason = `TMDB ID ${directId} 未命中 ${type}`
         }
     }
 
@@ -296,34 +468,47 @@ const autoMatchSingleItem = async (item, apiKey) => {
         const yearParam = targetYear ? `&${type === 'movie' ? 'primary_release_year' : 'first_air_date_year'}=${targetYear}` : ''
         let url = `https://api.tmdb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN${yearParam}`
         
-        let res = await fetch(url)
-        let data = await res.json()
-        let candidates = data.results || []
-        bestMatch = findBestMatch(candidates, targetYear)
+        let data = await fetchTmdbJsonCached(url)
+        let candidates = (data.results || []).filter(r => (r.media_type ? r.media_type !== 'person' : true))
+        bestMatch = findBestMatch(candidates, item.searchQuery, targetYear)
+        let bestScore = bestMatch ? scoreTmdbCandidate(bestMatch, item.searchQuery, targetYear) : -1
 
-        if (!bestMatch && targetYear) {
+        if ((!bestMatch || bestScore < 60) && targetYear) {
            url = `https://api.tmdb.org/3/search/${type}?api_key=${apiKey}&query=${q}&language=zh-CN`
-           res = await fetch(url)
-           data = await res.json()
-           candidates = data.results || []
-           bestMatch = findBestMatch(candidates, targetYear)
+           data = await fetchTmdbJsonCached(url)
+           candidates = (data.results || []).filter(r => (r.media_type ? r.media_type !== 'person' : true))
+           const fallbackBest = findBestMatch(candidates, item.searchQuery, targetYear)
+           const fallbackScore = fallbackBest ? scoreTmdbCandidate(fallbackBest, item.searchQuery, targetYear) : -1
+           if (fallbackBest && (!bestMatch || fallbackScore > bestScore)) {
+             bestMatch = fallbackBest
+             bestScore = fallbackScore
+           }
+        }
+
+        if (!bestMatch) {
+          failReason = targetYear ? `未找到候选：${item.searchQuery} (${targetYear})` : `未找到候选：${item.searchQuery}`
+        } else if (bestScore < 60) {
+          failReason = `候选置信度过低：${item.searchQuery}`
         }
     }
 
-    if (bestMatch) {
-      applyTmdbMatch(item, bestMatch)
+    if (matchRunId !== currentMatchRunId) return
+    if (bestMatch && scoreTmdbCandidate(bestMatch, item.searchQuery, item.year) >= 60) {
+      applyTmdbMatch(item, bestMatch, matchRunId)
     } else {
        item.status = 'failed'
-       item.errorMsg = directId ? `ID ${directId} 无效且搜索无果` : '未找到匹配项'
+       item.errorMsg = failReason || (directId ? `ID ${directId} 无效且搜索无果` : '未找到匹配项')
     }
   } catch (e) {
+    if (matchRunId !== currentMatchRunId) return
     console.error(e)
     item.status = 'failed'
-    item.errorMsg = 'API 请求错误'
+    item.errorMsg = e?.message?.startsWith('TMDB HTTP') ? `TMDB 请求失败：${e.message}` : 'API 请求错误'
   }
 }
 
-const applyTmdbMatch = (item, tmdbData) => {
+const applyTmdbMatch = (item, tmdbData, matchRunId = currentMatchRunId) => {
+  if (matchRunId !== currentMatchRunId) return
   const type = tmdbData.media_type || (tmdbData.title ? 'movie' : 'tv') 
   const title = tmdbData.name || tmdbData.title
   const year = (tmdbData.first_air_date || tmdbData.release_date || '').split('-')[0]
@@ -348,7 +533,7 @@ const applyTmdbMatch = (item, tmdbData) => {
     originCountry
   }
   
-  const sourceType = (panType.value !== 'json' && shareUrl.value) ? panType.value : 'json';
+  const sourceType = item.sourceContext?.panType || 'json'
   
   item.finalJson = rebuildJsonWithTmdb(
     item.files, 
@@ -381,9 +566,10 @@ const searchTmdbManual = async () => {
   
   try {
     const q = encodeURIComponent(tmdbSearchQuery.value)
-    const res = await fetch(`https://api.tmdb.org/3/search/multi?api_key=${apiKey}&query=${q}&language=zh-CN`)
-    const data = await res.json()
-    tmdbDropdownList.value = (data.results || []).filter(i => i.media_type !== 'person')
+    const data = await fetchTmdbJsonCached(`https://api.tmdb.org/3/search/multi?api_key=${apiKey}&query=${q}&language=zh-CN`)
+    tmdbDropdownList.value = (data.results || [])
+      .filter(i => i.media_type !== 'person')
+      .sort((a, b) => scoreTmdbCandidate(b, tmdbSearchQuery.value, null) - scoreTmdbCandidate(a, tmdbSearchQuery.value, null))
   } catch(e) {
     showToast("搜索失败，请检查网络", "error")
   } finally { 
@@ -421,7 +607,7 @@ const submitAll = async () => {
         genres: (item.tmdbInfo.genres || []).join(','),
         originalLanguage: item.tmdbInfo.originalLanguage,
         originCountry: item.tmdbInfo.originCountry,
-        sourceType: (panType.value !== 'json' && shareUrl.value) ? panType.value : 'json',
+        sourceType: item.sourceContext?.panType || 'json',
         jsonData: item.finalJson
       }
       
@@ -438,6 +624,9 @@ const submitAll = async () => {
       } else {
         item.status = 'failed'
         item.errorMsg = json.error || '后台错误'
+        if ((json.error || '').includes('S01E01')) {
+          item.errorMsg = `剧集识别失败：${json.error}`
+        }
       }
     } catch(e) {
       item.status = 'failed'
@@ -450,11 +639,32 @@ const submitAll = async () => {
   showToast(`批量处理完成: 成功 ${successCount} / 总计 ${itemsToSubmit.length}`, successCount === itemsToSubmit.length ? "success" : "warning")
 }
 
+const getFailureHint = (item) => {
+  const msg = String(item?.errorMsg || '')
+  if (msg.includes('剧集识别失败') || msg.includes('S01E01')) return '建议把文件或目录改成明确季集格式，如 S01E01 / 第1季 第2集'
+  if (msg.includes('TMDB ID')) return '建议检查目录里的 TMDB ID 或媒体类型判断'
+  if (msg.includes('未找到候选')) return '建议精简标题、去掉年份或直接手动搜索'
+  if (msg.includes('置信度过低')) return '建议手动搜索确认，避免错误匹配'
+  if (msg.includes('TMDB 请求失败')) return '建议稍后重试，或检查 TMDB Key / 网络连通性'
+  return '建议手动搜索修正后再入库'
+}
+
+const getFailureTag = (item) => {
+  const msg = String(item?.errorMsg || '')
+  if (msg.includes('剧集识别失败') || msg.includes('S01E01')) return '剧集识别'
+  if (msg.includes('TMDB ID')) return 'ID问题'
+  if (msg.includes('未找到候选')) return '标题问题'
+  if (msg.includes('置信度过低')) return '候选偏弱'
+  if (msg.includes('TMDB 请求失败')) return '网络问题'
+  return '需人工处理'
+}
+
 const toggleIgnore = (item) => {
   if (item.status === 'ignored') {
     item.status = 'pending'
     const apiKey = globalConfig.tmdbKey || ''
-    autoMatchSingleItem(item, apiKey)
+    const matchRunId = ++currentMatchRunId
+    autoMatchSingleItem(item, apiKey, matchRunId)
   } else {
     item.status = 'ignored'
   }
@@ -478,7 +688,7 @@ const toggleIgnore = (item) => {
       <div class="relative group">
         <textarea v-model="universalInput" @input="handleInput" :disabled="importQueue.length > 0"
           class="w-full h-24 p-4 bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 outline-none font-mono text-xs text-slate-600 resize-none transition-all shadow-inner disabled:opacity-50 disabled:cursor-not-allowed placeholder:text-slate-400" 
-          placeholder="在此粘贴分享链接 (123/夸克/189) 或 RapidTransfer JSON..."></textarea>
+          placeholder="在此粘贴分享链接 (123/189) 或 RapidTransfer JSON..."></textarea>
         
         <div class="absolute bottom-3 right-3 px-2.5 py-1 rounded-md text-[10px] font-bold transition-all duration-300 transform flex items-center gap-1.5 pointer-events-none" 
              :class="detectState.style">
@@ -491,15 +701,38 @@ const toggleIgnore = (item) => {
 
       <Transition enter-active-class="transition ease-out duration-300" enter-from-class="opacity-0 -translate-y-2 h-0 overflow-hidden" enter-to-class="opacity-100 translate-y-0 h-auto overflow-hidden">
         <div v-if="showLinkOptions" class="mt-3">
-           <div class="p-3 bg-indigo-50/50 rounded-xl border border-indigo-100 flex items-center gap-3">
-                <div class="flex-1 relative">
-                    <i class="fa-solid fa-key absolute left-3 top-1/2 -translate-y-1/2 text-indigo-300 text-xs"></i>
-                    <input type="text" v-model="sharePassword" class="w-full pl-8 pr-3 py-2 bg-white rounded-lg border border-indigo-100 text-xs outline-none focus:border-indigo-400 text-slate-600 placeholder:text-indigo-200" placeholder="提取码 (自动识别)">
+           <div class="p-3 bg-indigo-50/50 rounded-xl border border-indigo-100 space-y-3">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="text-xs text-indigo-700 font-bold">已识别 {{ linkTasks.length }} 条分享链接</div>
+                    <button @click="startParsing" :disabled="isParsing || linkTasks.length === 0" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 disabled:bg-indigo-400 transition-colors shadow-sm shadow-indigo-200 flex items-center gap-2 min-w-[120px] justify-center">
+                        <i v-if="isParsing" class="fa-solid fa-circle-notch fa-spin"></i>
+                        {{ isParsing ? `${parsePercent}%` : '开始批量解析' }}
+                    </button>
                 </div>
-                <button @click="startParsing" :disabled="isParsing" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 disabled:bg-indigo-400 transition-colors shadow-sm shadow-indigo-200 flex items-center gap-2 min-w-[100px] justify-center">
-                    <i v-if="isParsing" class="fa-solid fa-circle-notch fa-spin"></i>
-                    {{ isParsing ? `${parsePercent}%` : '开始解析' }}
-                </button>
+                <div class="max-h-40 overflow-y-auto custom-scrollbar space-y-2">
+                    <div v-for="task in linkTasks" :key="task.id" class="flex items-center justify-between gap-3 rounded-lg border border-indigo-100 bg-white px-3 py-2 text-[10px]">
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="px-1.5 py-0.5 rounded border border-indigo-200 bg-indigo-50 text-indigo-700 font-bold">{{ task.panType }}</span>
+                                <span class="truncate text-slate-600" :title="task.shareUrl">{{ task.shareUrl }}</span>
+                            </div>
+                            <div class="mt-1 text-slate-400 truncate">
+                                <span v-if="task.sharePassword">提取码: {{ task.sharePassword }}</span>
+                                <span v-else>未识别提取码</span>
+                                <span v-if="task.parseMessage"> · {{ task.parseMessage }}</span>
+                                <span v-if="task.errorMsg" class="text-red-500"> · {{ task.errorMsg }}</span>
+                            </div>
+                        </div>
+                        <div class="flex-shrink-0 font-bold"
+                             :class="task.status === 'done' ? 'text-emerald-600' : task.status === 'failed' ? 'text-red-500' : task.status === 'parsing' ? 'text-indigo-500' : 'text-slate-400'">
+                            <span v-if="task.status === 'done'">已完成</span>
+                            <span v-else-if="task.status === 'failed'">失败</span>
+                            <span v-else-if="task.status === 'parsing'">解析中</span>
+                            <span v-else>待解析</span>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-[10px] text-indigo-400">第一版建议：每条链接单独一行，密码尽量与链接同行。</p>
            </div>
            <p v-if="isParsing" class="text-[10px] text-center mt-2 text-indigo-400 font-mono animate-pulse">{{ parseStatusText }}</p>
         </div>
@@ -558,6 +791,7 @@ const toggleIgnore = (item) => {
                             <div class="flex flex-wrap gap-1.5 mt-1">
                                 <span v-if="item.year" class="text-[10px] font-mono text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded border border-slate-200">{{ item.year }}</span>
                                 <span v-if="item.isTV" class="text-[10px] font-bold text-blue-500 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-100">TV</span>
+                                <span class="text-[10px] font-bold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 uppercase">{{ item.sourceContext?.panType || 'json' }}</span>
                                 <span class="text-[10px] text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded border border-slate-100 truncate max-w-[150px]"><i class="fa-regular fa-file mr-1"></i>{{ getOriginalName(item) }}</span>
                             </div>
                         </div>
@@ -565,7 +799,11 @@ const toggleIgnore = (item) => {
                         <div class="flex justify-between items-end mt-1">
                             <div class="text-[10px] font-medium">
                                 <span v-if="item.status === 'loading'" class="text-indigo-400 flex items-center gap-1"><i class="fa-solid fa-spinner fa-spin"></i> 正在处理...</span>
-                                <span v-else-if="item.status === 'failed'" class="text-red-500 flex items-center gap-1"><i class="fa-solid fa-circle-exclamation"></i> {{ item.errorMsg || '无匹配' }}</span>
+                                <span v-else-if="item.status === 'failed'" class="text-red-500 flex items-center gap-1 flex-wrap">
+                                  <i class="fa-solid fa-circle-exclamation"></i>
+                                  <span>{{ item.errorMsg || '无匹配' }}</span>
+                                  <span class="px-1.5 py-0.5 rounded border border-red-200 bg-red-50 text-[9px] font-bold">{{ getFailureTag(item) }}</span>
+                                </span>
                                 <span v-else-if="item.status === 'matched'" class="text-emerald-600 flex items-center gap-1"><i class="fa-solid fa-link"></i> TMDB {{ item.tmdbInfo.id }}</span>
                                 <span v-else-if="item.status === 'ignored'" class="text-slate-400">已忽略</span>
                             </div>
@@ -577,6 +815,10 @@ const toggleIgnore = (item) => {
                 </div>
 
                 <div v-if="item.expanded" class="bg-slate-50 border-t border-slate-100 p-2 text-[10px] animate-in slide-in-from-top-1 duration-200">
+                    <div v-if="item.status === 'failed'" class="mb-2 p-2 rounded-lg border border-amber-200 bg-amber-50 text-amber-700">
+                        <div class="font-bold mb-1 flex items-center gap-1"><i class="fa-solid fa-lightbulb"></i> 修正建议</div>
+                        <div>{{ getFailureHint(item) }}</div>
+                    </div>
                     <div class="max-h-32 overflow-y-auto custom-scrollbar space-y-1">
                         <div v-for="(file, fIdx) in item.files" :key="fIdx" class="flex justify-between items-center p-1.5 rounded bg-white border border-slate-200/50">
                             <span class="truncate w-3/4 text-slate-600" :title="file.path.split('/').pop()">{{ file.path.split('/').pop() }}</span>

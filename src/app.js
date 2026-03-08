@@ -18,7 +18,6 @@ import { createLogger } from './logger.js';
 
 import { create123RapidTransfer } from "./services/service123.js";
 import { create189RapidTransfer } from "./services/service189.js";
-import { createQuarkRapidTransfer } from "./services/serviceQuark.js";
 
 import { 
     analyzeName, 
@@ -46,15 +45,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = Fastify({ 
     logger: true, 
     bodyLimit: 50 * 1024 * 1024 // 50MB
-});
-
-// [修复 415 错误] 注册 XML 解析器以支持 WebDAV
-app.addContentTypeParser(['application/xml', 'text/xml'], (req, payload, done) => {
-    let data = '';
-    payload.on('data', chunk => { data += chunk; });
-    payload.on('end', () => {
-        done(null, data);
-    });
 });
 
 // [优化] 注册压缩插件
@@ -348,18 +338,6 @@ app.post('/api/do/', async (req, reply) => {
     return { success: false, message: `Unknown action: ${action}` };
 });
 
-async function handleMetadataMigration(newData, reqLogger) {
-    const { tmdbId, name, year, genres, originalLanguage, originCountry } = newData;
-    const oldSeries = await prisma.seriesMain.findUnique({ where: { tmdbId }, include: { episodes: true } });
-    if (!oldSeries) return false;
-    const isChanged = oldSeries.name !== name || oldSeries.year !== year || oldSeries.originalLanguage !== originalLanguage || oldSeries.originCountry !== originCountry || oldSeries.genres !== genres;
-    if (isChanged) {
-        logger.info({ tmdbId }, `[Migration] 元数据变更`);
-        return true; 
-    }
-    return false;
-}
-
 app.post('/api/submit', async (req, reply) => {
     const { 
         tmdbId, jsonData, seriesName, seriesYear, 
@@ -375,10 +353,6 @@ app.post('/api/submit', async (req, reply) => {
     logger.info({ seriesName, fileCount, sourceType }, `[Submit] 📥 收到入库请求 (安全分批版)`);
 
     try {
-        const needRegenerateAll = await handleMetadataMigration({ 
-            tmdbId, name: seriesName, year: seriesYear, genres, originalLanguage, originCountry 
-        }, req.log);
-        
         await prisma.seriesMain.upsert({
             where: { tmdbId },
             update: {
@@ -406,8 +380,11 @@ app.post('/api/submit', async (req, reply) => {
                     const deleteSet = new Set(); 
 
                     for (const file of batchFiles) {
-                        const { season, episode } = parseSeasonEpisode(file.clean_name, type);
+                        const { season, episode, hasExplicitMarker } = parseSeasonEpisode(file.clean_name, type);
                         const tier = file.type || 'video';
+                        if (type === 'tv' && tier !== 'subtitle' && !hasExplicitMarker && batchFiles.length > 1) {
+                            throw new Error(`TV 文件缺少明确季集标记，已拒绝默认归并到 S01E01: ${file.clean_name}`);
+                        }
                         
                         if (tier === 'subtitle') {
                             subtitlesList.push({
@@ -450,7 +427,10 @@ app.post('/api/submit', async (req, reply) => {
 
                 } else {
                     for (const file of batchFiles) {
-                        const { season, episode } = parseSeasonEpisode(file.clean_name, type);
+                        const { season, episode, hasExplicitMarker } = parseSeasonEpisode(file.clean_name, type);
+                        if (type === 'tv' && (file.type || 'video') !== 'subtitle' && !hasExplicitMarker && batchFiles.length > 1) {
+                            throw new Error(`TV 文件缺少明确季集标记，已拒绝默认归并到 S01E01: ${file.clean_name}`);
+                        }
                         
                         const pending = await tx.pendingEpisode.create({
                             data: {
@@ -529,8 +509,13 @@ app.post('/api/webhook/upload', async (req, reply) => {
     const tmdbMatch = file_name.match(RE_TMDB_TAG) || path.match(RE_TMDB_TAG);
     if (!tmdbMatch) return { status: 'error', message: 'Missing {tmdb=xxx} tag' };
     const tmdbId = parseInt(tmdbMatch[1]);
-    const { season, episode } = parseSeasonEpisode(file_name, path.includes('Season') || path.includes('剧集') ? 'tv' : 'movie');
-    const mediaType = (season > 0 || episode > 0) ? 'tv' : 'movie';
+    const tvHint = /Season\s*\d+/i.test(path) || /剧集|第[一二三四五六七八九十0-9]+季/.test(path) || RE_SEASON_EPISODE.test(file_name) || /[Ee][Pp]?\d{1,3}/.test(file_name) || /第\d{1,3}[集话]/.test(file_name);
+    const inferredType = tvHint ? 'tv' : 'movie';
+    const { season, episode, hasExplicitMarker } = parseSeasonEpisode(file_name, inferredType, path);
+    const mediaType = inferredType === 'tv' || (season > 0 || episode > 0) ? 'tv' : 'movie';
+    if (mediaType === 'tv' && !hasExplicitMarker && !isSubtitleLikePath(path)) {
+        return { status: 'error', message: 'TV 文件缺少明确季集标记，拒绝默认归并到 S01E01' };
+    }
     const nowTime = new Date();
     
     let series = await prisma.seriesMain.findUnique({ where: { tmdbId } });
@@ -603,7 +588,6 @@ app.get('/api/stream', async (req, reply) => {
     try {
         if (panType === '123') await create123RapidTransfer(shareUrl, sharePassword, writer);
         else if (panType === '189') await create189RapidTransfer(shareUrl, sharePassword, writer);
-        else if (panType === 'quark') await createQuarkRapidTransfer(shareUrl, sharePassword, cookie, writer);
         else throw new Error(`不支持的网盘类型: ${panType}`);
         logger.info(`[Stream] 解析完成`);
     } catch (e) {
@@ -614,18 +598,13 @@ app.get('/api/stream', async (req, reply) => {
     }
 });
 
-app.post('/api/callback/123', async (req, reply) => {
-    const { id } = req.query;
-    // 移除了局部的 secret 校验，由统一鉴权处理
-    const body = req.body;
-    logger.info({ id, status: body.status }, `[Callback] 收到 123 离线下载回调`);
-    await prisma.pendingEpisode.update({ where: { id: parseInt(id) }, data: { taskId: body.status === 0 ? 'DONE' : undefined } });
-    return { code: 0 };
-});
-
 setInterval(() => {
     core123.recycleAllCacheFolders().catch(err => { logger.error(err, '❌ [Schedule] Daily cleanup failed'); });
 }, 24 * 60 * 60 * 1000);
+
+function isSubtitleLikePath(filePath = '') {
+    return /\.(srt|ass|ssa|sub|vtt)$/i.test(filePath);
+}
 
 async function fetchTmdbMeta(id, type) {
     let apiKey = process.env.TMDB_API_KEY;
@@ -647,15 +626,52 @@ async function fetchTmdbMeta(id, type) {
     return null;
 }
 
-function parseSeasonEpisode(name, type) {
-    const match = name.match(RE_SEASON_EPISODE);
-    if (match) return { season: parseInt(match[1]), episode: parseInt(match[2]) };
-    return type === 'movie' ? { season: 0, episode: 0 } : { season: 1, episode: 1 };
+function parseSeasonEpisode(name, type, fullPath = '') {
+    const text = `${name || ''} ${fullPath || ''}`;
+    const standardMatch = text.match(RE_SEASON_EPISODE);
+    if (standardMatch) {
+        return { season: parseInt(standardMatch[1]), episode: parseInt(standardMatch[2]), hasExplicitMarker: true };
+    }
+
+    const seasonMatch = text.match(/(?:Season|S)\s*(\d+)/i) || text.match(/第([一二三四五六七八九十0-9]+)季/);
+    const episodeMatch = text.match(/[Ee][Pp]?(\d{1,3})/) || text.match(/第(\d{1,3})[集话]/);
+
+    const cnNumMap = { '一':1,'二':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10,'零':0,'〇':0,'两':2 };
+    const cnToInt = (str) => {
+        if (!str) return 0;
+        if (/^\d+$/.test(str)) return parseInt(str);
+        let val = 0;
+        let tmp = 0;
+        for (const c of str) {
+            const n = cnNumMap[c];
+            if (n !== undefined) {
+                if (c === '十') {
+                    val += (tmp === 0 ? 1 : tmp) * 10;
+                    tmp = 0;
+                } else {
+                    tmp = n;
+                }
+            }
+        }
+        return val + tmp;
+    };
+
+    const season = seasonMatch ? (/^\d+$/.test(seasonMatch[1]) ? parseInt(seasonMatch[1]) : cnToInt(seasonMatch[1])) : 0;
+    const episode = episodeMatch ? parseInt(episodeMatch[1]) : 0;
+    const hasExplicitMarker = season > 0 || episode > 0;
+
+    if (hasExplicitMarker) {
+        return { season: season || 1, episode: episode || 1, hasExplicitMarker };
+    }
+
+    return type === 'movie'
+        ? { season: 0, episode: 0, hasExplicitMarker: false }
+        : { season: 1, episode: 1, hasExplicitMarker: false };
 }
 
 app.setNotFoundHandler((req, reply) => {
     if (req.raw.url.startsWith('/api')) {
-        reply.code(404).send({ error: 'API/WebDAV Not Found' });
+        reply.code(404).send({ error: 'API Not Found' });
     } else {
         reply.sendFile('index.html');
     }

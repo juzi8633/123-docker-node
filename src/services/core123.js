@@ -1,6 +1,6 @@
 // src/services/core123.js
 import redis from '../redis.js';
-import { prisma } from '../db.js'; 
+import { prisma } from '../db.js';
 import { Web123Client } from './web123Client.js';
 import { createLogger } from '../logger.js';
 
@@ -11,7 +11,7 @@ const logger = createLogger('Core123');
 const inflightRequests = new Map();
 
 const KEY_DLINK_PREFIX = "123:dlink:";
-const KEY_DIR_PREFIX = "123:dir:"; 
+const KEY_DIR_PREFIX = "123:dir:";
 const KEY_TOKEN_PREFIX = "123:token:"; // Token 缓存前缀
 const VIP_CACHE_NAME = "123_Node_Cache"; // 缓存目录前缀
 
@@ -44,15 +44,15 @@ export class Core123Service {
    */
   async reloadConfig() {
     try {
-        logger.info('🔍 [Config] 开始加载 WebAPI 账号配置...'); 
-        
+        logger.info('🔍 [Config] 开始加载 WebAPI 账号配置...');
+
         const targetKeys = ['account_vip', 'account_workers'];
         const configs = await prisma.systemConfig.findMany({
             where: { key: { in: targetKeys } }
         });
-        
-        logger.info({ 
-            foundCount: configs.length, 
+
+        logger.info({
+            foundCount: configs.length,
             keysFound: configs.map(c => c.key)
         }, '🔍 [Config] 数据库查询结果');
 
@@ -70,10 +70,10 @@ export class Core123Service {
                 const passport = parts[0];
                 const password = parts[1];
                 const cachedToken = await redis.get(`${KEY_TOKEN_PREFIX}${passport}`);
-                
-                this.vipClient = new Web123Client({ 
+
+                this.vipClient = new Web123Client({
                     passport, password, role: 'vip',
-                    token: cachedToken || "", 
+                    token: cachedToken || "",
                     onTokenRefresh: tokenSaveCallback
                 });
                 logger.info(`🔍 [Config] 主账号已加载: ${passport}`);
@@ -92,10 +92,10 @@ export class Core123Service {
                     const passport = parts[0].trim();
                     const password = parts[1].trim();
                     const cachedToken = await redis.get(`${KEY_TOKEN_PREFIX}${passport}`);
-                    
-                    const client = new Web123Client({ 
+
+                    const client = new Web123Client({
                         passport, password, role: 'worker',
-                        token: cachedToken || "", 
+                        token: cachedToken || "",
                         onTokenRefresh: tokenSaveCallback
                     });
                     this.workerClients.push(client);
@@ -109,7 +109,7 @@ export class Core123Service {
             this.workerClients.push(this.vipClient);
             logger.info(`⚠️ 未配置工兵账号，将使用 VIP 账号执行探测`);
         }
-        
+
     } catch (e) {
         logger.error({ err: e.message }, `❌ 配置重载发生异常`);
     }
@@ -146,7 +146,7 @@ export class Core123Service {
   // =======================================================
   async getDownloadUrlByHash(filename, etag, size, S3KeyFlag, userAgent) {
     const redisKey = `${KEY_DLINK_PREFIX}${etag}`;
-    
+
     // 1. 查缓存
     const cachedUrl = await redis.get(redisKey);
     if (cachedUrl) return cachedUrl;
@@ -183,10 +183,10 @@ export class Core123Service {
             const url = await client.getDownloadUrl({
                 etag, size: Number(size), filename, S3KeyFlag: targetS3Key
             }, userAgent);
-            
+
             if (url) {
                 // 缓存 6 天
-                await redis.set(redisKey, url, 'EX', 518400); 
+                await redis.set(redisKey, url, 'EX', 518400);
             }
             return url;
         } catch (e) {
@@ -196,7 +196,7 @@ export class Core123Service {
             inflightRequests.delete(etag);
         }
     })();
-    
+
     inflightRequests.set(etag, task);
     return task;
   }
@@ -245,7 +245,7 @@ export class Core123Service {
           let dirID = 0;
           if (mkRes.code === 0 && mkRes.data) {
               dirID = mkRes.data.Info ? mkRes.data.Info.FileId : mkRes.data.FileId;
-          } 
+          }
           if (!dirID) {
              const listRes = await client.fsList(0, 1, 50);
              const target = listRes.data?.InfoList?.find(f => f.FileName === folderName && f.Type === 1);
@@ -260,12 +260,12 @@ export class Core123Service {
       } catch (e) {
           logger.error({ err: e.message }, `获取缓存目录失败`);
       }
-      return 0; 
+      return 0;
   }
 
   async recycleAllCacheFolders() {
       if (!this.vipClient) return;
-      const targetOffsets = [-1, -2]; 
+      const targetOffsets = [-1, -2];
       for (const offset of targetOffsets) {
           const folderName = `${VIP_CACHE_NAME}_${getDatestamp(offset)}`;
           const redisKey = `${KEY_DIR_PREFIX}${this.vipClient.passport}:${folderName}`;
@@ -280,57 +280,19 @@ export class Core123Service {
       }
   }
 
-  // =======================================================
-  // 核心业务 4: 离线下载 (封装实现)
-  // =======================================================
-  
-  /**
-   * 提交离线下载任务
-   * @param {string} downloadUrl - 文件下载直链
-   * @param {string} fileName - 保存的文件名
-   * @param {string} callbackUrl - 回调通知地址
-   */
-  async addOfflineTask(downloadUrl, fileName, callbackUrl) {
-      if (!this.vipClient) await this.reloadConfig();
-      if (!this.vipClient) throw new Error("VIP 账号未配置");
-
-      const token = this.vipClient.token;
-      const parentID = await this.getCacheDirID(this.vipClient, VIP_CACHE_NAME);
-      
-      const res = await fetch("https://open-api.123pan.com/api/v1/offline/download", {
-          method: "POST",
-          headers: { 
-              "Authorization": `Bearer ${token}`, 
-              "Platform": "open_platform", 
-              "Content-Type": "application/json" 
-          },
-          body: JSON.stringify({
-              url: downloadUrl, 
-              fileName: fileName, 
-              dirID: parentID, 
-              callBackUrl: callbackUrl
-          })
-      });
-
-      const json = await res.json();
-      if (json.code !== 0) {
-          throw new Error(`123API Error: ${json.message}`);
-      }
-      return json.data; // 返回 { taskID: ... }
-  }
 
   async uploadFile(localPath) {
       const client = await this.getVipClient();
       const parentID = await this.getCacheDirID(client, VIP_CACHE_NAME);
       return await client.uploadFile(localPath, parentID);
   }
-  
+
   // 辅助方法：暴露 Token 给某些特殊需求（如查询进度）
   async getVipToken() {
       const client = await this.getVipClient();
       return client.token;
   }
-  
+
   async getUploadParentID() {
       const client = await this.getVipClient();
       return await this.getCacheDirID(client, VIP_CACHE_NAME);

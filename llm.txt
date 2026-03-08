@@ -1,0 +1,786 @@
+# 123-docker-node / llm.txt
+
+This document is a code-grounded guide for LLMs and coding agents working on `/root/123-docker-node`.
+It reflects the current repository as actually read from source, not an idealized architecture.
+Do not assume missing modules or future intentions. If a behavior is not visible in the code, do not invent it.
+
+Read this file together with:
+- `package.json`
+- `docker-compose.yml`
+- `Dockerfile`
+- `prisma/schema.prisma`
+- `src/app.js`
+- `src/db.js`
+- `src/redis.js`
+- `src/queue.js`
+- `src/logger.js`
+- `src/services/core123.js`
+- `src/services/web123Client.js`
+- `src/services/service123.js`
+- `src/services/service189.js`
+- `src/services/serviceQuark.js`
+- `src/utils.js`
+- `ui/src/App.vue`
+- `ui/src/components/*`
+- `ui/src/utils/*`
+
+--------------------------------------------------
+1. What this project really is
+--------------------------------------------------
+
+This is not just a plain Node CRUD backend.
+It is a small full-stack media-ingestion and library-management service for cloud-drive-based media workflows.
+
+Current code shows five major responsibilities:
+- maintain a local media library index in SQLite via Prisma
+- parse share links from 123 / 189 / Quark and turn them into normalized import JSON
+- accept trusted imports directly or queue non-trusted imports for background verification / offline processing
+- use Redis + BullMQ for background task dispatch and lock/caching behavior
+- serve a Vue single-page admin UI from the same Fastify process
+
+A good mental model is:
+- `SeriesMain` = one movie or one show
+- `SeriesEpisode` = actual stored playable/subtitle file rows
+- `PendingEpisode` = staged tasks waiting for verification/offline handling
+- backend = control plane + ingestion pipeline
+- frontend = operator console
+
+--------------------------------------------------
+2. Runtime and deployment shape
+--------------------------------------------------
+
+Files:
+- `package.json`
+- `docker-compose.yml`
+- `Dockerfile`
+
+2.1 Runtime stack
+- Node.js ESM project (`"type": "module"`)
+- Fastify backend
+- Prisma ORM
+- SQLite database
+- Redis
+- BullMQ queue worker running in the same process as the API server
+- Vue + Vite frontend built into static assets and served by Fastify
+
+2.2 Package-level signals
+`package.json` shows:
+- backend entrypoint is `node src/app.js`
+- DB schema is pushed via `prisma db push`
+- uses `better-sqlite3`, `bullmq`, `ioredis`, `axios`, `got`, `undici`, `pino`
+
+Interpretation:
+- this project mixes HTTP control APIs with queue-driven background work
+- it is not designed as a cleanly separated API/worker pair yet; the same runtime boot handles both
+
+2.3 Docker shape
+`docker-compose.yml`:
+- app service exposes port `3000`
+- mounts `./data:/app/data`
+- Redis is separate container
+- SQLite DB file is stored in mounted volume
+
+Important mismatch to remember:
+- compose sets `DATABASE_URL=file:/app/data/dev.db`
+- Dockerfile sets `DATABASE_URL="file:/data/prod.db"`
+- runtime final command uses `npx prisma db push && node src/app.js`
+
+Interpretation:
+- path handling matters
+- `src/db.js` contains path-fix logic to compensate for Prisma/Node path differences
+
+2.4 Dockerfile behavior
+Multi-stage build:
+- stage 1 builds frontend
+- stage 2 installs production backend deps, copies backend code, copies built frontend to `/app/public`, runs `prisma generate`
+- final startup runs schema push and backend start
+
+Meaning:
+- UI is compiled into static assets at image build time
+- backend is responsible for serving SPA assets and APIs together
+
+--------------------------------------------------
+3. Data model
+--------------------------------------------------
+
+File: `prisma/schema.prisma`
+
+3.1 `SeriesMain`
+Represents one movie or one TV series.
+Fields include:
+- `tmdbId` as primary key
+- `name`
+- `year`
+- `type` (`movie` or `tv`)
+- `genres`
+- `originalLanguage`
+- `originCountry`
+- `lastUpdated`
+
+It is the public/library-level row.
+
+Indexes indicate actual query intentions:
+- filter by `type + originalLanguage`
+- filter by `type + genres`
+- sort/recent queries by `lastUpdated`
+- optimized recent-updated index with `(lastUpdated desc, tmdbId, name, year)`
+
+Interpretation:
+- recent-update browsing is an intended hot path
+- library search/list does not appear to use many heavy relational joins
+
+3.2 `SeriesEpisode`
+Represents actual file rows, not only TV episodes.
+Fields include:
+- auto-increment `id`
+- `tmdbId`
+- `season`
+- `episode`
+- `cleanName`
+- `size`
+- `etag`
+- `S3KeyFlag`
+- `score`
+- `type` (`video` or `subtitle`)
+- `createdAt`
+
+Important interpretation:
+- movie files also live here using season/episode `0/0`
+- the same table stores subtitles and videos
+- `score` is the version-selection mechanism
+
+3.3 `PendingEpisode`
+Represents staging tasks for items not directly trusted/imported.
+Fields include:
+- `etag`, `tmdbId`, `season`, `episode`, `cleanName`, `size`, `score`
+- `type`
+- `sourceType`
+- `sourceRef`
+- `retryCount`
+- `taskId`
+- `nextRetryAt`
+
+Interpretation:
+- this is a task-state table, not final library storage
+- queue lifecycle and admin UI both rely on it
+
+3.4 `SystemConfig`
+Simple key-value config table.
+Stores runtime credentials and operator settings such as:
+- `tmdb_key`
+- `quark_cookie`
+- `account_vip`
+- `account_workers`
+- `cloud189_token`
+
+--------------------------------------------------
+4. Backend entrypoint and HTTP model
+--------------------------------------------------
+
+File: `src/app.js`
+
+4.1 App setup
+- Fastify app with logger enabled
+- `bodyLimit` increased to 50MB for large JSON imports
+- registers XML parser to support WebDAV-style XML payloads
+- registers gzip/compress
+- serves static frontend from `../public`
+
+Interpretation:
+- this backend is not only JSON API; it also expects XML-ish/WebDAV requests somewhere in the ecosystem
+- current source only shows XML parser registration, not a large WebDAV route surface; do not assume more than that
+
+4.2 Auth model
+A single shared secret is used for `/api*` protection.
+Current preHandler behavior:
+- whitelist for `/api/webhook/emby`, `/api/stream`, `/`, `/assets/*`, `/favicon.ico`
+- for other `/api` routes, secret can come from:
+  - `Authorization` header
+  - query `key`
+  - body `secret`
+
+Interpretation:
+- auth is coarse-grained, app-wide shared-secret auth
+- frontend login simply validates the secret, then stores it in `localStorage`
+- this is admin-console auth, not multi-user auth
+
+4.3 Global error handling
+- uses `app.setErrorHandler(...)`
+- many routes intentionally removed local try/catch and rely on global handler
+- some mutating routes still keep local try/catch for custom responses
+
+Interpretation:
+- error handling is mixed but mostly centralized for read routes
+
+--------------------------------------------------
+5. Database bootstrap and SQLite tuning
+--------------------------------------------------
+
+File: `src/db.js`
+
+This file does more than create Prisma.
+It performs three roles:
+
+5.1 Prisma bootstrap
+- exports `prisma = new PrismaClient()`
+- immediately runs SQLite PRAGMA tuning via top-level await
+
+5.2 SQLite performance tuning
+Applied via Prisma and also via `better-sqlite3`:
+- `journal_mode = WAL`
+- `synchronous = NORMAL`
+- `temp_store = MEMORY`
+- `cache_size = -64000`
+
+Interpretation:
+- the repository is explicitly optimized for SQLite concurrent-read/write behavior
+- writes are expected often enough that WAL matters
+
+5.3 Path repair and D1-like adapter
+- repairs `DATABASE_URL` path quirks
+- auto-creates DB directory
+- creates a `better-sqlite3` instance as `sqlite`
+- exports `DB.prepare(...)` and `DB.batch(...)` with a D1-like wrapper API
+
+Important observation:
+- current backend routes/services mainly use Prisma, not `DB`
+- the D1 adapter exists for compatibility or legacy helper usage, not as the main path
+
+--------------------------------------------------
+6. Redis and queue model
+--------------------------------------------------
+
+Files:
+- `src/redis.js`
+- `src/queue.js`
+
+6.1 Redis client
+`src/redis.js` exports:
+- shared Redis client
+- `REDIS_CONNECTION_CONFIG` for BullMQ reuse
+
+Behavior:
+- retry strategy with capped delay
+- `maxRetriesPerRequest = null` for BullMQ compatibility
+
+6.2 Queue architecture
+`src/queue.js` creates:
+- `downloadQueue`
+- one BullMQ `Worker`
+
+Current worker config:
+- `concurrency: 1`
+- limiter `max: 1, duration: 3000`
+
+Interpretation:
+- queue is intentionally serialized / throttled
+- throughput is intentionally low to protect upstream pan APIs and avoid repeated races
+
+6.3 Task behavior
+Each job roughly does:
+1. resolve pending row id if needed
+2. acquire Redis lock by `etag`
+3. dedupe against final `SeriesEpisode`
+4. try rapid-upload / reuse probe via `core123.probeFileByHash(...)`
+5. if reusable, write final `SeriesEpisode` row directly
+6. otherwise try offline task submission (except Quark, which is explicitly unsupported for offline here)
+7. update `PendingEpisode.taskId`
+
+Important semantics:
+- duplicate / lower-score files are deleted from pending queue and skipped
+- subtitle/video distinction affects dedupe and replacement behavior
+- pending rows are the queue truth source
+
+6.4 189 special path
+- 189 tasks require resolving a temporary direct link through `resolve189Link(...)`
+- token is read from Redis key `auth:189:token`
+
+Interpretation:
+- 189 support is partially normalized into the same queue pipeline
+- but it still has provider-specific URL signing logic in queue worker
+
+--------------------------------------------------
+7. Logging model
+--------------------------------------------------
+
+File: `src/logger.js`
+
+Logging uses Pino.
+Key facts:
+- dev uses `pino-pretty`
+- prod keeps structured output
+- no pid/hostname in base fields
+- custom child logger helper `createLogger(moduleName)`
+
+Interpretation:
+- the project already moved away from pure `console.log`
+- but some files still use raw console in lower-level helpers (`db.js`, `redis.js`, some frontend helpers)
+- logging style is improved but not fully uniform
+
+--------------------------------------------------
+8. Core 123 service
+--------------------------------------------------
+
+File: `src/services/core123.js`
+
+This is the central backend service layer for 123-pan integration.
+It owns:
+- VIP client
+- worker client pool
+- token persistence
+- direct link caching
+- probe/reuse logic
+- cache-directory lifecycle
+- offline download submission
+
+8.1 Client roles
+- `vipClient`: used for storage/download/offline operations
+- `workerClients`: used for probing / upload_request reuse checks
+
+Interpretation:
+- account separation is intentional
+- worker accounts absorb probe pressure
+- VIP account handles final privileged operations
+
+8.2 Token persistence
+- refreshed tokens are written back to Redis under `123:token:${passport}`
+- config reload reconstructs clients using DB config + cached Redis token
+
+Interpretation:
+- token storage is ephemeral-but-persistent-across-process-restarts as long as Redis survives
+
+8.3 Direct-link fetch path
+`getDownloadUrlByHash(...)`:
+- first checks Redis by `123:dlink:${etag}`
+- then checks in-memory inflight lock by `etag`
+- if no `S3KeyFlag`, probes the file via worker account
+- asynchronously backfills `S3KeyFlag` into DB
+- uses VIP client to get final download URL
+- caches final URL for 6 days
+
+Important semantics:
+- `etag` is the primary identity for direct-link cache and inflight de-duplication
+- DB writeback of `S3KeyFlag` is intentionally async and non-blocking
+
+8.4 Probe path
+`probeFileByHash(...)`:
+- uses worker account round-robin
+- sanitizes filename but actually sends `.tempfile` in upload request metadata
+- waits 1 second before probe as crude rate limiting
+- returns `{ reuse: true, S3KeyFlag? }` or `false`
+
+Interpretation:
+- probe is really a remote rapid-upload eligibility test, not content inspection
+
+8.5 Cache-directory management
+- creates date-based cache folder names like `123_Node_Cache_YYYY-MM-DD`
+- caches dir IDs in Redis
+- background recycle tries to clean older folders
+
+Important observation:
+- actual trash call is commented out in `recycleAllCacheFolders()`
+- current effective behavior is mostly Redis-key cleanup, not confirmed physical folder deletion
+- do not claim old folders are truly deleted unless code is changed
+
+8.6 Offline task submission
+`addOfflineTask(...)`:
+- calls 123 open API offline download endpoint
+- stores into current cache dir
+- accepts callback URL
+
+--------------------------------------------------
+9. Low-level 123 Web API client
+--------------------------------------------------
+
+File: `src/services/web123Client.js`
+
+This file is a thin but noisy SDK wrapper.
+
+9.1 Client design
+- wraps Axios instance
+- stores passport/password/token
+- sets common headers
+- supports token refresh callback
+- uses `loginPromise` as in-flight login lock
+
+9.2 Interceptor behavior
+Request interceptor:
+- logs full request details
+- suppresses raw binary upload payload in logs
+
+Response interceptor:
+- logs response payloads
+- treats code `0` or `200` as success
+- auto-retries once on `401` by logging in again
+- throws structured business error otherwise
+
+Interpretation:
+- this is a convenience client, not a minimal SDK
+- current logging here is very verbose and may be noisy in production
+
+9.3 Implemented API groups
+- login
+- file info/list/mkdir/trash
+- upload_request
+- upload file through presigned S3 URL
+- get final download URL
+
+Important semantics:
+- `uploadRequest(...)` is dual-purpose: folder creation, probe/reuse, upload init
+- `uploadFile(...)` falls back to actual S3 PUT if reuse fails
+- `getDownloadUrl(...)` builds final URL from host prefix + download path
+
+--------------------------------------------------
+10. Share-link parsers
+--------------------------------------------------
+
+Files:
+- `src/services/service123.js`
+- `src/services/service189.js`
+- `src/services/serviceQuark.js`
+
+These services have one common role:
+- parse a share link
+- recursively scan files
+- normalize output into a common rapid-transfer JSON structure
+- stream progress to frontend via SSE writer
+
+10.1 Common export structure
+All three generators eventually output something like:
+- `scriptVersion`
+- `exportVersion`
+- `usesBase62EtagsInExport`
+- `commonPath`
+- `files[]`
+- `totalFilesCount`
+- `totalSize`
+
+This means the import UI can treat them as one normalized upstream format.
+
+10.2 123 parser
+- validates share URL host/pattern
+- fetches share title first
+- recursively scans with paging
+- pushes `{ path, etag, size, S3KeyFlag }`
+
+10.3 189 parser
+- resolves shareCode/shareId
+- optional password check
+- signs requests via MD5 over sorted params
+- recursively scans folders/files
+- stores `source_ref` as `fileId|shareId`
+
+10.4 Quark parser
+- obtains `stoken`
+- recursively scans all files
+- then batch-fetches MD5 for found files
+- uses retry wrapper for unstable endpoints
+
+Important interpretation:
+- Quark integration is more expensive because MD5 is a second phase
+- 189 integration preserves provider-specific reference IDs for later queue resolution
+- SSE progress events are part of the API contract for frontend UX
+
+--------------------------------------------------
+11. Utility logic and scoring model
+--------------------------------------------------
+
+Files:
+- `src/utils.js`
+- `ui/src/utils/logic.js`
+
+There are two related utility layers:
+- backend utility set in `src/utils.js`
+- frontend parsing/grouping/rebuild utility set in `ui/src/utils/logic.js`
+
+11.1 Shared philosophy
+Both sides encode the same broad product assumptions:
+- file names are messy and need aggressive heuristics
+- TMDB tagging in folder/file names is first-class
+- season/episode parsing must tolerate multiple formats
+- quality score decides which video version wins
+- subtitles are attached to chosen best video version
+
+11.2 Scoring model
+Key current rules:
+- files > 30GB => score 0
+- DV / Dolby Vision => score 0
+- resolution, source, codec, HDR, audio, and golden-size zone add points
+- movie and TV use different preferred size ranges
+
+Interpretation:
+- this project is not neutral about file versions
+- it encodes a strong opinion: online-stream-friendly and compatibility-friendly versions are preferred over archival heavy files
+
+11.3 Frontend grouping and rebuild
+`autoGroupFiles(...)`:
+- filters unsupported extensions and junk extras
+- extracts year/TMDB/title/season/episode info heuristically
+- groups into movie/show candidates
+
+`rebuildJsonWithTmdb(...)`:
+- rebuilds normalized import JSON using TMDB-confirmed title/year/id
+- chooses best video per episode/movie by score
+- attaches subtitles to chosen base name
+
+Interpretation:
+- frontend does substantial pre-ingestion normalization, not just display
+- backend still revalidates/standardizes later
+
+--------------------------------------------------
+12. Main backend APIs
+--------------------------------------------------
+
+File: `src/app.js`
+
+12.1 Health
+- `GET /api/health`
+
+12.2 Library read APIs
+- `GET /api/search`
+  - paginated search over `SeriesMain`
+  - requires that `episodes: { some: {} }` exists
+- `GET /api/details?id=...`
+  - returns `SeriesMain` + ordered `SeriesEpisode[]`
+
+Interpretation:
+- a main row is considered library-visible only if it has at least one episode/file row
+
+12.3 Pending task APIs
+- `GET /api/pending/list`
+  - filter by `pending`, `downloading`, `failed`
+- `POST /api/pending/delete`
+- `POST /api/do/` with action `ADD_TASKS`
+
+12.4 Config APIs
+- `GET /api/config`
+- `POST /api/config`
+
+Important semantics:
+- config save also synchronizes `cloud189_token` into Redis
+- config save triggers `core123.reloadConfig()`
+- config save clears TMDB metadata memory cache
+
+12.5 Admin destructive API
+- `POST /api/admin/clear-db`
+  - deletes all `SeriesEpisode` and `SeriesMain`
+
+12.6 Import/submit API
+- `POST /api/submit`
+
+This is a key route.
+It supports two modes:
+- trusted source (`123` or `json`) => directly writes final `SeriesEpisode`
+- untrusted source (`189`, `quark`, etc.) => creates `PendingEpisode` rows and queues tasks
+
+Important semantics:
+- `handleMetadataMigration(...)` only detects changed metadata now; current code returns a boolean but does not visibly trigger a larger regeneration path
+- trusted import deduplicates by `(tmdbId, season, episode)` and overwrites non-subtitle video rows in batch
+- untrusted import creates staged rows first, then queues background jobs after transaction
+
+12.7 Delete APIs
+- `DELETE /api/delete/series`
+- `DELETE /api/delete/episode`
+
+12.8 Webhook upload API
+- `POST /api/webhook/upload`
+
+Behavior:
+- requires `file_name` and `etag`
+- extracts `{tmdb=xxx}` from file name or path
+- lazily creates `SeriesMain` from TMDB if missing
+- standardizes name
+- computes score for videos
+- skips lower-score overwrite
+- writes file row and queues verification job
+
+Interpretation:
+- webhook path is an opportunistic ingestion path for newly uploaded files
+- it uses score-based replacement, not version coexistence for videos
+
+12.9 Streaming parse API
+- `GET /api/stream`
+
+This is SSE-based and delegates to the provider parser service.
+
+12.10 123 offline callback
+- `POST /api/callback/123`
+
+Current behavior:
+- marks pending row `taskId` as `DONE` when callback status is 0
+- otherwise leaves it unchanged/undefined
+
+Important observation:
+- this callback updates task state, but current code shown does not finalize a downloaded pending file into `SeriesEpisode` here
+- do not assume callback alone completes ingestion into final library rows
+
+--------------------------------------------------
+13. Frontend app structure
+--------------------------------------------------
+
+Files:
+- `ui/src/App.vue`
+- `ui/src/components/*`
+- `ui/src/utils/*`
+
+13.1 App shell
+`ui/src/App.vue` is the root UI shell.
+It controls:
+- secret-based login state
+- fetch interceptor for automatic `Authorization` injection
+- tab switching between library/import/verification views
+- config drawer
+- global toast/confirm overlays
+
+Interpretation:
+- frontend auth is purely local secret persistence + backend validation
+- there is no route-level SPA router; tab state is internal component switching
+
+13.2 Login flow
+`LoginView.vue`:
+- tries `GET ./api/config` with provided password in `Authorization`
+- on success stores `secret` in localStorage
+- emits `login-success`
+
+13.3 Config panel
+`ConfigPanel.vue`:
+- edits backend config keys
+- persists via `POST ./api/config`
+- after save re-fetches config
+
+13.4 Library view
+`LibraryView.vue`:
+- uses `/api/search` for paged library browsing
+- uses `/api/details` for expandable detail row
+- supports delete series / delete episode
+- supports copying series data as structured JSON
+
+Important frontend/backend mismatch to remember:
+- frontend sorts by `last_updated`, but backend response schema uses `lastUpdated`
+- if sorting issues appear, inspect field naming carefully rather than assuming logic is correct
+
+13.5 Import view
+`ImportView.vue`:
+- accepts raw JSON or share URLs
+- detects provider type
+- opens SSE parse stream via `/api/stream`
+- groups parsed files locally
+- batch auto-matches TMDB
+- rebuilds normalized import JSON
+- later submits via `/api/submit`
+
+Interpretation:
+- frontend performs a lot of ingestion intelligence before the backend write step
+
+13.6 Verification view
+`VerificationView.vue`:
+- polls `/api/pending/list`
+- maintains selection state
+- can retry selected tasks through `/api/do/`
+- can bulk-delete pending rows
+
+--------------------------------------------------
+14. Frontend utility modules
+--------------------------------------------------
+
+Files:
+- `ui/src/utils/configStore.js`
+- `ui/src/utils/dialog.js`
+- `ui/src/utils/dispatcher.js`
+- `ui/src/utils/toast.js`
+
+14.1 `configStore.js`
+- global reactive store for backend config
+- `initConfig()` fetches `/api/config`
+
+14.2 `dialog.js`
+- Promise-based global confirm modal state
+
+14.3 `dispatcher.js`
+- packages selected pending items and posts `ADD_TASKS` to `/api/do/`
+
+Important observation:
+- payload field names here use snake_case (`clean_name`, `source_type`, `source_ref`)
+- backend `/api/do/` expects/uses camelCase-ish access in places (`name`, `sourceType`, `sourceRef`)
+- this is a real area to read carefully before changing retry logic
+
+14.4 `toast.js`
+- reactive global toast queue
+
+--------------------------------------------------
+15. Important implementation truths and easy-to-misread semantics
+--------------------------------------------------
+
+15.1 Final library rows vs pending rows are distinct
+- `SeriesEpisode` = accepted/finalized library file rows
+- `PendingEpisode` = staged work items
+Do not merge these concepts when modifying queue logic.
+
+15.2 Trusted vs untrusted import source is a core branch
+- `123` and `json` are treated as trusted in `/api/submit`
+- others go through pending queue
+This distinction affects whether files enter library immediately or not.
+
+15.3 Score decides overwrite, not coexistence
+For videos of same `(tmdbId, season, episode)`:
+- lower-score version is skipped
+- higher-score version can replace previous non-subtitle rows
+Subtitles are additive alongside chosen video.
+
+15.4 Movies are stored as episode-like rows
+Movie imports use season/episode `0/0` logic in multiple places.
+Do not assume `SeriesEpisode` means “TV only”.
+
+15.5 Queue worker is intentionally serialized
+The queue is not slow by accident.
+Current `concurrency: 1` and limiter indicate deliberate throttling.
+Do not casually raise concurrency without checking upstream API sensitivity and lock semantics.
+
+15.6 `recycleAllCacheFolders()` does not currently guarantee remote deletion
+The trash call is commented out.
+Current code mainly cleans Redis directory-id cache entries.
+
+15.7 Frontend source contains substantial business logic
+Especially in import/grouping/rebuild flows.
+Do not treat frontend as dumb presentation-only code.
+
+15.8 Some naming mismatches likely exist
+Examples visible from source:
+- frontend library sort references `last_updated` while backend returns `lastUpdated`
+- dispatcher sends snake_case fields while backend routes often use camelCase-like names
+Treat such mismatches as real potential bug surfaces.
+
+--------------------------------------------------
+16. Safe editing guidelines for this repo
+--------------------------------------------------
+
+When modifying this repository:
+- read the real route + queue + utility code before changing ingestion behavior
+- distinguish trusted direct import from staged pending import
+- preserve score-based best-version semantics unless intentionally redesigning it
+- remember that the same process runs API + queue worker
+- be careful with provider-specific fields like `S3KeyFlag`, `source_ref`, `taskId`, `cloud189_token`
+- do not assume 123 / 189 / Quark share parsers are interchangeable internally; only their output format is normalized
+- do not claim webhook/offline callback fully finalizes ingestion unless code explicitly writes final library rows
+
+Low-risk changes usually look like:
+- field-name consistency fixes
+- logging noise reduction
+- better null/undefined handling in config and queue payloads
+- UI/backend contract alignment
+- local batching where business semantics do not change
+
+Higher-risk changes usually look like:
+- changing queue concurrency/limiting
+- altering score rules
+- merging pending/final tables conceptually
+- changing direct-import trust semantics
+- rewriting share parser recursion behavior
+
+--------------------------------------------------
+17. Current missing-context caution
+--------------------------------------------------
+
+This repo contains a complete visible backend tree and a largely complete frontend tree, but understanding must still remain code-bound.
+If a future task asks about behavior not visible in the current files, verify first.
+Do not infer undocumented provider guarantees or remote API semantics beyond what the code actually does.

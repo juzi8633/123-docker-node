@@ -8,7 +8,6 @@ const isSaving = ref(false)
 
 const form = ref({
     tmdb_key: '',
-    quark_cookie: '',
     account_vip: '',
     account_workers: '',
     open123_dir_id: '',
@@ -19,7 +18,6 @@ const form = ref({
 
 onMounted(() => {
     form.value.tmdb_key = globalConfig.tmdbKey || ''
-    form.value.quark_cookie = globalConfig.quarkCookie || ''
     form.value.account_vip = globalConfig.account_vip || ''
     form.value.account_workers = globalConfig.workerAccounts || ''
     form.value.open123_dir_id = globalConfig.open123DirId || ''
@@ -29,7 +27,6 @@ onMounted(() => {
     if (globalConfig.embyConfig) {
         form.value.emby_config = { ...globalConfig.embyConfig }
     }
-    form.value.frontend_verify_interval = parseInt(localStorage.getItem('pending_refresh_interval') || '3')
 })
 
 const handleSave = async () => {
@@ -38,7 +35,6 @@ const handleSave = async () => {
         const payload = {
             configs: {
                 tmdb_key: form.value.tmdb_key,
-                quark_cookie: form.value.quark_cookie,
                 account_vip: form.value.account_vip,
                 account_workers: form.value.account_workers,
                 open123_dir_id: form.value.open123_dir_id,
@@ -95,10 +91,6 @@ const handleSave = async () => {
                         <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">189 Cloud Token</label>
                         <input type="password" v-model="form.cloud189_token" placeholder="天翼云 AccessToken" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md">
                     </div>
-                    <div class="group">
-                        <label class="block text-[11px] font-bold text-slate-400 ml-1 mb-1 uppercase tracking-wider">Quark Cookie</label>
-                        <textarea v-model="form.quark_cookie" rows="3" placeholder="填写夸克网盘 Cookie" class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition-all text-sm shadow-sm group-hover:shadow-md resize-none custom-scrollbar"></textarea>
-                    </div>
                 </div>
             </div>
 
@@ -127,25 +119,6 @@ const handleSave = async () => {
                 </div>
             </div>
 
-            <div class="space-y-4 pb-4">
-                <div class="flex items-center gap-2 px-1">
-                    <i class="fa-solid fa-gauge-high text-indigo-500"></i>
-                    <span class="text-sm font-bold text-slate-700">交互偏好</span>
-                </div>
-                <div class="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between">
-                    <div>
-                        <div class="text-xs font-bold text-slate-600">刷新间隔 (秒传队列)</div>
-                        <div class="text-[10px] text-slate-400">降低频率可减轻浏览器负担</div>
-                    </div>
-                    <div class="flex items-center gap-3">
-                         <input type="range" v-model="form.frontend_verify_interval" min="1" max="10" step="1" 
-                            class="w-24 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600 hover:accent-indigo-500">
-                        <span class="text-xs font-mono font-bold text-white bg-indigo-500 px-2 py-0.5 rounded min-w-[3em] text-center shadow-sm">
-                            {{ form.frontend_verify_interval }}s
-                        </span>
-                    </div>
-                </div>
-            </div>
 
         </div>
 
